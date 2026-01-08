@@ -1,0 +1,47 @@
+# =========================
+# DeepStream / TensorRT
+# =========================
+**/*.engine
+**/*.plan
+**/*.trt
+**/*.cache
+**/.cache/
+**/cache/
+**/models/**/*.engine
+**/models/**/*.plan
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Optional: don't commit huge raw datasets
+# (pero vamos a conservar videos mp4 porque tú quieres)
+# =========================
+# **/*.mkv
+# **/*.avi

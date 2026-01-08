@@ -1,0 +1,44 @@
+FROM nvcr.io/nvidia/deepstream:8.0-gc-triton-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DS_ROOT=/opt/nvidia/deepstream/deepstream-8.0
+ENV VENV_DIR=/opt/venvs/pyds
+
+# Paquetes para venv + compilar pyds
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-venv python3-pip python3-setuptools \
+    python3.12-dev \
+    build-essential pkg-config cmake \
+    pybind11-dev libeigen3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# (Opcional) librerías para evitar warnings de plugins de gstreamer (audio/dvd/etc)
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     libflac12 libmpg123-0 libdca0 libdvdread8 libdvdnav4 libmp3lame0 \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Crear venv + numpy compatible
+RUN python3 -m venv --system-site-packages ${VENV_DIR} && \
+    ${VENV_DIR}/bin/python -m pip install --upgrade pip && \
+    ${VENV_DIR}/bin/pip install --force-reinstall "numpy==1.26.0"
+
+# Copiar deepstream_python_apps (solo para construir pyds durante el build)
+WORKDIR /tmp/deepstream_python_apps
+COPY _dsdev/deepstream_python_apps /tmp/deepstream_python_apps
+
+# Instalar pyds desde bindings en el venv (siempre limpio)
+RUN rm -rf /tmp/deepstream_python_apps/bindings/build && \
+    find /tmp/deepstream_python_apps/bindings -name CMakeCache.txt -delete && \
+    ${VENV_DIR}/bin/pip install /tmp/deepstream_python_apps/bindings && \
+    rm -rf /tmp/deepstream_python_apps
+
+
+# Paths útiles para libs de DeepStream
+ENV LD_LIBRARY_PATH=${DS_ROOT}/lib:${DS_ROOT}/lib/gst-plugins:${LD_LIBRARY_PATH}
+ENV PATH=${VENV_DIR}/bin:${PATH}
+
+# Entrypoint: activa el venv automáticamente
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

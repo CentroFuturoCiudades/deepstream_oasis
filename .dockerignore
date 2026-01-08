@@ -1,0 +1,18 @@
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# builds/caches típicos
+**/build/
+**/dist/
+**/*.egg-info/
+**/.cache/
+
+# deepstream_python_apps bindings build (clave)
+_dsdev/deepstream_python_apps/bindings/build/
+_dsdev/deepstream_python_apps/bindings/**/CMakeCache.txt
+_dsdev/deepstream_python_apps/bindings/**/CMakeFiles/
+
+# venvs locales (no se deben meter al build)
+**/pyds/
+**/.venv/
