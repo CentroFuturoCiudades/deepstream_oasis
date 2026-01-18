@@ -10,7 +10,7 @@ WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
 
 DOCKER_ARGS=(
-  -it --rm
+  -it
   --gpus all
   --net=host
   --ipc=host

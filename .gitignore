@@ -2,6 +2,7 @@
 # DeepStream / TensorRT
 # =========================
 **/*.engine
+**/*.mp4
 **/*.plan
 **/*.trt
 **/*.cache
@@ -45,3 +46,5 @@ Thumbs.db
 # =========================
 # **/*.mkv
 # **/*.avi
+
+deepstream_python_apps/
