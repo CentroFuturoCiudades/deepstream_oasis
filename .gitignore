@@ -2,6 +2,7 @@
 # DeepStream / TensorRT
 # =========================
 **/*.engine
+**/*.onnx
 **/*.mp4
 **/*.plan
 **/*.trt

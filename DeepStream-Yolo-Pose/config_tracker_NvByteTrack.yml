@@ -1,16 +1,16 @@
 BaseConfig:
-  minDetectorConfidence: 0.05
+  minDetectorConfidence: 0.25
 
 TargetManagement:
   maxTargetsPerStream: 150
-  probationAge: 3
-  maxShadowTrackingAge: 30
-  earlyTerminationAge: 2
+  probationAge: 20
+  maxShadowTrackingAge: 60
+  earlyTerminationAge: 15
 
 DataAssociator:
   associationMatcherType: 1   # IoU
   checkClassMatch: 1
-  minMatchingScore4Iou: 0.1
+  minMatchingScore4Iou: 0.35
 
 StateEstimator:
   stateEstimatorType: 2       # Kalman

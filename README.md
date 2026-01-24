@@ -9,6 +9,15 @@ DeepStream 8.0 Python pipeline to run **RTSP inference** and save the result as 
 - Encodes to H.264 → MP4
 - Stops after N seconds (from first frame)
 
+## setup
+
+```bash
+'git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git'
+
+'export CUDA_VER=XY.Z'
+'make -C nvdsinfer_custom_impl_Yolo clean && make -C nvdsinfer_custom_impl_Yolo'
+'make -C nvdsinfer_custom_impl_Yolo_Pose clean && make -C nvdsinfer_custom_impl_Yolo_Pose'
+
 ## Run
 
 ```bash
@@ -18,4 +27,5 @@ DeepStream 8.0 Python pipeline to run **RTSP inference** and save the result as 
   --out ../../outputs/output.mp4 \
   --seconds 10 \
   --osd'
+
 

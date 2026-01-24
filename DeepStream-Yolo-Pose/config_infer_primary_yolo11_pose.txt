@@ -1,17 +1,20 @@
 [property]
 gpu-id=0
+infer-dims=3;960;960
 net-scale-factor=0.0039215697906911373
 model-color-format=0
-onnx-file=yolo11s-pose.onnx
-model-engine-file=yolo11s-pose.onnx_b1_gpu0_fp16.engine
+onnx-file=yolo11m-pose.onnx
+model-engine-file=yolo11m-pose.onnx_b1_gpu0_fp16.engine
 #int8-calib-file=calib.table
 labelfile-path=labels.txt
 batch-size=1
 network-mode=2
 num-detected-classes=1
 interval=0
-gie-unique-id=1
+gie-unique-id=2
 process-mode=1
+operate-on-gie-id=1         
+
 network-type=3
 cluster-mode=4
 maintain-aspect-ratio=1
@@ -26,12 +29,6 @@ output-instance-mask=1
 
 [class-attrs-all]
 pre-cluster-threshold=0.1
-
-[tracker]
-enable=1
-tracker-width=640
-tracker-height=384
-gpu-id=0
 
 ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
 ll-config-file=config_tracker_NvDeepSORT.yml

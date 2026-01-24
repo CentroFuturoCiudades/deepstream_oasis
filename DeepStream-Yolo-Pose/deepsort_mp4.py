@@ -230,6 +230,8 @@ def nvosd_sink_pad_buffer_probe(pad, info, user_data):
             break
 
         l_obj = frame_meta.obj_meta_list
+        print("Objetos detectados:", frame_meta.num_obj_meta)
+
         while l_obj:
             try:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -255,7 +257,7 @@ def nvosd_sink_pad_buffer_probe(pad, info, user_data):
             bw = bbox.width
             bh = bbox.height
 
-            keypoints = extract_keypoints(obj_meta)
+            #keypoints = extract_keypoints(obj_meta)
 
             row = [
                 frame,
@@ -266,16 +268,16 @@ def nvosd_sink_pad_buffer_probe(pad, info, user_data):
                 round(bh, 2),
             ]
 
-            for (x, y, c) in keypoints:
-                row += [
-                    round(x, 2),
-                    round(y, 2),
-                    round(c, 3),
-                ]
+            #for (x, y, c) in keypoints:
+            #    row += [
+            #        round(x, 2),
+            #        round(y, 2),
+            #        round(c, 3),
+            #    ]
 
             csv_writer.writerow(row)
 
-            parse_pose_from_meta(batch_meta, frame_meta, obj_meta)
+            #parse_pose_from_meta(batch_meta, frame_meta, obj_meta)
             set_custom_bbox(obj_meta)
 
             try:
@@ -468,7 +470,7 @@ def main(source_uri, infer_config, output_mp4, streammux_w, streammux_h, gpu_id)
 
     # streammux
     nvstreammux.set_property("batch-size", STREAMMUX_BATCH_SIZE)
-    nvstreammux.set_property("batched-push-timeout", 25000)
+    nvstreammux.set_property("batched-push-timeout", 100000)
     nvstreammux.set_property("width", STREAMMUX_WIDTH)
     nvstreammux.set_property("height", STREAMMUX_HEIGHT)
     nvstreammux.set_property("live-source", 0 if source_uri.startswith("file://") else 1)
@@ -577,8 +579,8 @@ def main(source_uri, infer_config, output_mp4, streammux_w, streammux_h, gpu_id)
 
     # joints: kp0_x, kp0_y, kp0_conf, ...
     num_kp = 17  # YOLO11-Pose
-    for i in range(num_kp):
-        header += [f"kp{i}_x", f"kp{i}_y", f"kp{i}_conf"]
+    #for i in range(num_kp):
+    #    header += [f"kp{i}_x", f"kp{i}_y", f"kp{i}_conf"]
 
     csv_writer.writerow(header)
 
