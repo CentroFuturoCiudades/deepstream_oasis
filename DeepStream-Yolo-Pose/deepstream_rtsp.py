@@ -7,6 +7,8 @@ Usage:
     python3 deepstream_rtsp.py -s rtsp://... -c config.txt -o output.mp4
 """
 
+from asyncio import log
+import queue
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
@@ -17,11 +19,24 @@ import csv
 import time
 import platform
 import argparse
+import uuid
+from datetime import datetime, timezone, timedelta
 from threading import Lock
 from ctypes import sizeof, c_float
+from threading import Thread
 
 sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 import pyds
+from queue import Queue
+
+
+# Import SendHelper for Event Hub integration
+try:
+    from send_helper import SendHelper
+    SEND_HELPER_AVAILABLE = True
+except ImportError:
+    SEND_HELPER_AVAILABLE = False
+    print("WARNING: send_helper not available. Database writes disabled.")
 
 # =============================================================================
 # Configuration
@@ -45,6 +60,15 @@ MAX_DISPLAY_ELEMENTS = 16
 NUM_KEYPOINTS = 17
 FPS_INTERVAL_SEC = 5
 RTSP_TIMEOUT_SEC = 10
+INFER_STRIDE = 3
+
+# Event Hub / Database Configuration
+CAMERA_ID = "-1"  # Hardcoded camera ID
+EH_MAX_RETRIES = 3
+EH_RETRY_DELAY = 0.5  # seconds
+
+# Mexico City timezone (UTC-6)
+MEXICO_TZ = timezone(timedelta(hours=-6))
 
 # COCO skeleton connectivity (1-indexed joint pairs)
 SKELETON = [
@@ -61,12 +85,19 @@ g_config = {
     "width": STREAMMUX_WIDTH,
     "height": STREAMMUX_HEIGHT,
     "gpu_id": GPU_ID,
-    "is_jetson": False
+    "is_jetson": False,
+    "enable_csv": True,
+    "enable_db": True,
 }
 g_fps_trackers = {}
 g_csv_file = None
 g_csv_writer = None
 
+# Event Hub / Database state
+g_send_helper = None
+g_track_to_person_id = {}  # Maps track_id -> person_id (persists while script runs)
+
+db_queue = Queue(maxsize=10000)
 
 # =============================================================================
 # FPS Tracker
@@ -249,8 +280,149 @@ def find_matching_pose(bbox, pose_detections, threshold=0.85):
 # Buffer Probe (Main Processing)
 # =============================================================================
 
+def get_mexico_timestamp():
+    """Get current timestamp in Mexico City timezone (ISO format)."""
+    return datetime.now(MEXICO_TZ).isoformat()
+
+
+def send_to_event_hub_with_retry(func, *args, **kwargs):
+    """
+    Execute a send function with retry logic.
+    Retries up to EH_MAX_RETRIES times, logs errors, and continues.
+    """
+    for attempt in range(EH_MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt < EH_MAX_RETRIES - 1:
+                time.sleep(EH_RETRY_DELAY)
+            else:
+                print(f"ERROR: Failed to send to Event Hub after {EH_MAX_RETRIES} attempts: {e}")
+    return None
+
+
+def format_bbox_for_db(bbox_tuple):
+    """
+    Convert bbox tuple (x, y, w, h) to dict format for database.
+    Values are already in frame coordinate scale.
+    """
+    x, y, w, h = bbox_tuple
+    return {
+        "x": float(round(x, 2)),
+        "y": float(round(y, 2)),
+        "width": float(round(w, 2)),
+        "height": float(round(h, 2))
+    }
+
+
+def format_skeleton_for_db(keypoints):
+    """
+    Convert keypoints list to dict format for database.
+    Keypoints are already in frame coordinate scale (same as width/height).
+    """
+    if not keypoints:
+        return None
+    
+    # COCO keypoint names
+    kp_names = [
+        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+        "left_wrist", "right_wrist", "left_hip", "right_hip",
+        "left_knee", "right_knee", "left_ankle", "right_ankle"
+    ]
+    
+    skeleton = []
+    for i, (x, y, conf) in enumerate(keypoints):
+        name = kp_names[i] if i < len(kp_names) else f"kp_{i}"
+        skeleton.append({
+            "name": name,
+            "x": float(round(x, 2)),
+            "y": float(round(y, 2)),
+            "confidence": float(round(conf, 3))
+        })
+    
+    return skeleton
+
+
+def process_detections_for_db(frame_num, normal_detections, pose_detections):
+    """
+    Process detections and send to Event Hub.
+    Handles frame, person_observed, and detection inserts.
+    """
+    global g_track_to_person_id, g_send_helper
+    
+    if not g_config["enable_db"] or g_send_helper is None:
+        return
+    
+    if not normal_detections:
+        return
+    
+    # Generate frame record
+    frame_id = str(uuid.uuid4())
+    timestamp = get_mexico_timestamp()
+    width = g_config["width"]
+    height = g_config["height"]
+    
+    # Send frame record
+    send_to_event_hub_with_retry(
+        g_send_helper.send_frame,
+        frame_id=frame_id,
+        camera_id=CAMERA_ID,
+        timestamp=timestamp,
+        width=width,
+        height=height,
+    )
+    
+    # Process each detection
+    for det in normal_detections:
+        track_id = det["track_id"]
+        
+        # Get or create person_id for this track
+        if track_id not in g_track_to_person_id:
+            person_id = str(uuid.uuid4())
+            g_track_to_person_id[track_id] = person_id
+            
+            # Insert new person record
+            send_to_event_hub_with_retry(
+                g_send_helper.send_person_observed,
+                person_id=person_id,
+                age_group=None,
+                camera_id=CAMERA_ID,
+            )
+        else:
+            person_id = g_track_to_person_id[track_id]
+        
+        # Get confidence from object meta
+        confidence = float(det.get("confidence", 0.0))
+        
+        # Format bbox
+        bbox = format_bbox_for_db(det["bbox"])
+        
+        # Match pose and format skeleton
+        skeleton = None
+        match = find_matching_pose(det["bbox"], pose_detections)
+        if match:
+            skeleton = format_skeleton_for_db(match["keypoints"])
+        
+        # Send detection record
+        detection_id = str(uuid.uuid4())
+        send_to_event_hub_with_retry(
+            g_send_helper.send_detection,
+            detection_id=detection_id,
+            frame_id=frame_id,
+            person_id=person_id,
+            confidence=confidence,
+            bbox=bbox,
+            skeleton=skeleton,
+            px_geometry=None,
+            real_geometry=None,
+            camera_id=CAMERA_ID,
+        )
+
+
 def osd_buffer_probe(pad, info, user_data):
-    """Process each frame: extract detections, match poses, write CSV, draw overlays."""
+    """Process each frame: extract detections, match poses, write CSV/DB, draw overlays."""
+
     buf = info.get_buffer()
     if not buf:
         return Gst.PadProbeReturn.OK
@@ -265,6 +437,16 @@ def osd_buffer_probe(pad, info, user_data):
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
             break
+        
+        if frame_meta.frame_num % INFER_STRIDE != 0:
+            try:
+                l_frame = l_frame.next
+            except StopIteration:
+                break
+            continue
+
+        print(frame_meta.frame_num)
+
 
         # Separate detections by type
         normal_detections = []
@@ -287,6 +469,7 @@ def osd_buffer_probe(pad, info, user_data):
                     "frame": frame_meta.frame_num,
                     "track_id": obj_meta.object_id,
                     "bbox": (bbox.left, bbox.top, bbox.width, bbox.height),
+                    "confidence": obj_meta.confidence,
                     "obj_meta": obj_meta
                 })
 
@@ -295,23 +478,42 @@ def osd_buffer_probe(pad, info, user_data):
             except StopIteration:
                 break
 
-        # Process detections and write to CSV
+        # Process detections and write to CSV (if enabled)
+        if g_config["enable_csv"] and g_csv_writer:
+            for det in normal_detections:
+                row = [
+                    det["frame"],
+                    det["track_id"],
+                    round(det["bbox"][0], 2),
+                    round(det["bbox"][1], 2),
+                    round(det["bbox"][2], 2),
+                    round(det["bbox"][3], 2),
+                ]
+
+                match = find_matching_pose(det["bbox"], pose_detections)
+                if match:
+                    for x, y, c in match["keypoints"]:
+                        row.extend([round(x, 2), round(y, 2), round(c, 3)])
+
+                g_csv_writer.writerow(row)
+        
+        # Send detections to database via Event Hub
+        #process_detections_for_db(frame_meta.frame_num, normal_detections, pose_detections)
+        try:
+            db_queue.put_nowait((
+                frame_meta.frame_num,
+                normal_detections,
+                pose_detections
+            ))
+        except queue.Full:
+            print("WARNING: DB queue full, dropping frame data")
+            pass  # drop frame silently
+
+
+
+        
+        # Set bbox style for visualization
         for det in normal_detections:
-            row = [
-                det["frame"],
-                det["track_id"],
-                round(det["bbox"][0], 2),
-                round(det["bbox"][1], 2),
-                round(det["bbox"][2], 2),
-                round(det["bbox"][3], 2),
-            ]
-
-            match = find_matching_pose(det["bbox"], pose_detections)
-            if match:
-                for x, y, c in match["keypoints"]:
-                    row.extend([round(x, 2), round(y, 2), round(c, 3)])
-
-            g_csv_writer.writerow(row)
             set_bbox_style(det["obj_meta"])
 
         # Draw pose skeletons
@@ -552,6 +754,10 @@ def build_pipeline(source_uri, infer_config, output_path):
 def init_csv():
     """Initialize CSV file with header."""
     global g_csv_file, g_csv_writer
+    
+    if not g_config["enable_csv"]:
+        print("CSV output disabled")
+        return
 
     g_csv_file = open(CSV_PATH, "w", newline="")
     g_csv_writer = csv.writer(g_csv_file)
@@ -561,14 +767,66 @@ def init_csv():
         header.extend([f"kp{i}_x", f"kp{i}_y", f"kp{i}_conf"])
 
     g_csv_writer.writerow(header)
+    print(f"CSV output enabled: {CSV_PATH}")
+
+
+def init_event_hub():
+    """Initialize Event Hub connection for database writes."""
+    global g_send_helper
+    
+    if not g_config["enable_db"]:
+        print("Database output disabled")
+        return
+    
+    if not SEND_HELPER_AVAILABLE:
+        print("WARNING: SendHelper not available. Database writes disabled.")
+        g_config["enable_db"] = False
+        return
+    
+    try:
+        g_send_helper = SendHelper()
+        print(f"Event Hub connection initialized (camera_id={CAMERA_ID})")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize Event Hub: {e}")
+        print("Database writes disabled.")
+        g_config["enable_db"] = False
+        g_send_helper = None
+
+
+def cleanup_event_hub():
+    """Close Event Hub connection."""
+    global g_send_helper
+    
+    if g_send_helper is not None:
+        try:
+            g_send_helper.close()
+            print("Event Hub connection closed")
+        except Exception as e:
+            print(f"WARNING: Error closing Event Hub: {e}")
+        g_send_helper = None
 
 
 # =============================================================================
 # Main
 # =============================================================================
 
-def main(source_uri, infer_config, output_path, width, height, gpu_id):
+def db_worker():
+    while True:
+        item = db_queue.get()
+        try:
+            frame_num, normal, pose = item
+            process_detections_for_db(frame_num, normal, pose)
+        except Exception as e:
+            log.error(f"DB worker error: {e}")
+        finally:
+            db_queue.task_done()
+
+
+def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_csv, enable_db):
     """Main entry point."""
+    db_thread = Thread(target=db_worker)
+    db_thread.start()
+
     global g_config
 
     Gst.init(None)
@@ -577,6 +835,8 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id):
     g_config["height"] = height
     g_config["gpu_id"] = gpu_id
     g_config["is_jetson"] = is_jetson()
+    g_config["enable_csv"] = enable_csv
+    g_config["enable_db"] = enable_db
 
     # Build pipeline
     pipeline, error = build_pipeline(source_uri, infer_config, output_path)
@@ -590,17 +850,21 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id):
     bus.add_signal_watch()
     bus.connect("message", on_bus_message, loop)
 
-    # Initialize CSV
+    # Initialize outputs
     init_csv()
+    init_event_hub()
 
     # Print configuration
     print(f"\n{'='*50}")
-    print(f"SOURCE:  {source_uri}")
-    print(f"CONFIG:  {infer_config}")
-    print(f"OUTPUT:  {output_path}")
-    print(f"SIZE:    {width}x{height}")
-    print(f"GPU:     {gpu_id}")
-    print(f"JETSON:  {g_config['is_jetson']}")
+    print(f"SOURCE:    {source_uri}")
+    print(f"CONFIG:    {infer_config}")
+    print(f"OUTPUT:    {output_path}")
+    print(f"SIZE:      {width}x{height}")
+    print(f"GPU:       {gpu_id}")
+    print(f"JETSON:    {g_config['is_jetson']}")
+    print(f"CSV:       {'enabled' if g_config['enable_csv'] else 'disabled'}")
+    print(f"DATABASE:  {'enabled' if g_config['enable_db'] else 'disabled'}")
+    print(f"CAMERA_ID: {CAMERA_ID}")
     print(f"{'='*50}\n")
 
     # Start pipeline
@@ -617,11 +881,24 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id):
 
     # Cleanup
     pipeline.set_state(Gst.State.NULL)
+    
     if g_csv_file:
         g_csv_file.close()
+    
 
     print(f"\nOutput saved: {output_path}")
-    print(f"Metadata saved: {CSV_PATH}\n")
+    if g_config["enable_csv"]:
+        print(f"Metadata saved: {CSV_PATH}")
+    if g_config["enable_db"]:
+        print(f"Database records sent via Event Hub")
+        print(f"Total tracked persons: {len(g_track_to_person_id)}")
+    print()
+
+    print("Waiting for DB queue to flush...")
+    db_queue.join()
+    print("All DB events sent")
+    cleanup_event_hub()
+
     return 0
 
 
@@ -642,6 +919,14 @@ def parse_args():
                         help="Processing height")
     parser.add_argument("-g", "--gpu", type=int, default=GPU_ID,
                         help="GPU device ID")
+    parser.add_argument("--enable-csv", action="store_true", default=True,
+                        help="Enable CSV metadata output (default: True)")
+    parser.add_argument("--disable-csv", action="store_true", default=False,
+                        help="Disable CSV metadata output")
+    parser.add_argument("--enable-db", action="store_true", default=True,
+                        help="Enable database output via Event Hub (default: True)")
+    parser.add_argument("--disable-db", action="store_true", default=False,
+                        help="Disable database output via Event Hub")
 
     args = parser.parse_args()
 
@@ -658,11 +943,18 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Handle enable/disable flags (disable takes precedence)
+    enable_csv = args.enable_csv and not args.disable_csv
+    enable_db = args.enable_db and not args.disable_db
+    
     sys.exit(main(
         source_uri=args.source,
         infer_config=args.config,
         output_path=args.output,
         width=args.width,
         height=args.height,
-        gpu_id=args.gpu
+        gpu_id=args.gpu,
+        enable_csv=enable_csv,
+        enable_db=enable_db,
     ))
