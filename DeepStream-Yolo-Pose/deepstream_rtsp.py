@@ -7,8 +7,6 @@ Usage:
     python3 deepstream_rtsp.py -s rtsp://... -c config.txt -o output.mp4
 """
 
-from asyncio import log
-import queue
 import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
@@ -21,13 +19,12 @@ import platform
 import argparse
 import uuid
 from datetime import datetime, timezone, timedelta
-from threading import Lock
+from threading import Lock, Thread
 from ctypes import sizeof, c_float
-from threading import Thread
+from queue import Queue, Empty
 
 sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 import pyds
-from queue import Queue
 
 
 # Import SendHelper for Event Hub integration
@@ -346,8 +343,8 @@ def format_skeleton_for_db(keypoints):
 
 def process_detections_for_db(frame_num, normal_detections, pose_detections):
     """
-    Process detections and send to Event Hub.
-    Handles frame, person_observed, and detection inserts.
+    Process detections and send to Event Hub using efficient batched method.
+    Uses send_frame_with_detections for optimal throughput.
     """
     global g_track_to_person_id, g_send_helper
     
@@ -363,38 +360,9 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
     width = g_config["width"]
     height = g_config["height"]
     
-    # Send frame record
-    send_to_event_hub_with_retry(
-        g_send_helper.send_frame,
-        frame_id=frame_id,
-        camera_id=CAMERA_ID,
-        timestamp=timestamp,
-        width=width,
-        height=height,
-    )
-    
-    # Process each detection
+    # Prepare detections with bbox and skeleton in correct format
+    prepared_detections = []
     for det in normal_detections:
-        track_id = det["track_id"]
-        
-        # Get or create person_id for this track
-        if track_id not in g_track_to_person_id:
-            person_id = str(uuid.uuid4())
-            g_track_to_person_id[track_id] = person_id
-            
-            # Insert new person record
-            send_to_event_hub_with_retry(
-                g_send_helper.send_person_observed,
-                person_id=person_id,
-                age_group=None,
-                camera_id=CAMERA_ID,
-            )
-        else:
-            person_id = g_track_to_person_id[track_id]
-        
-        # Get confidence from object meta
-        confidence = float(det.get("confidence", 0.0))
-        
         # Format bbox
         bbox = format_bbox_for_db(det["bbox"])
         
@@ -404,20 +372,24 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
         if match:
             skeleton = format_skeleton_for_db(match["keypoints"])
         
-        # Send detection record
-        detection_id = str(uuid.uuid4())
-        send_to_event_hub_with_retry(
-            g_send_helper.send_detection,
-            detection_id=detection_id,
-            frame_id=frame_id,
-            person_id=person_id,
-            confidence=confidence,
-            bbox=bbox,
-            skeleton=skeleton,
-            px_geometry=None,
-            real_geometry=None,
-            camera_id=CAMERA_ID,
-        )
+        prepared_detections.append({
+            "track_id": det["track_id"],
+            "confidence": float(det.get("confidence", 0.0)),
+            "bbox": bbox,
+            "skeleton": skeleton,
+        })
+    
+    # Send all at once using the efficient bulk method
+    # This queues all events for async batched sending
+    g_send_helper.send_frame_with_detections(
+        frame_id=frame_id,
+        camera_id=CAMERA_ID,
+        timestamp=timestamp,
+        width=width,
+        height=height,
+        detections=prepared_detections,
+        track_to_person_id=g_track_to_person_id,
+    )
 
 
 def osd_buffer_probe(pad, info, user_data):
@@ -497,19 +469,15 @@ def osd_buffer_probe(pad, info, user_data):
 
                 g_csv_writer.writerow(row)
         
-        # Send detections to database via Event Hub
-        #process_detections_for_db(frame_meta.frame_num, normal_detections, pose_detections)
+        # Send detections to database via Event Hub (non-blocking queue)
         try:
             db_queue.put_nowait((
                 frame_meta.frame_num,
                 normal_detections,
                 pose_detections
             ))
-        except queue.Full:
-            print("WARNING: DB queue full, dropping frame data")
-            pass  # drop frame silently
-
-
+        except:
+            pass  # Queue full, drop silently to avoid blocking pipeline
 
         
         # Set bbox style for visualization
@@ -794,13 +762,26 @@ def init_event_hub():
 
 
 def cleanup_event_hub():
-    """Close Event Hub connection."""
+    """Close Event Hub connection and print stats."""
     global g_send_helper
     
     if g_send_helper is not None:
         try:
+            # Print stats before closing
+            stats = g_send_helper.get_stats()
+            print(f"\n[Event Hub Stats]")
+            print(f"  Events queued:  {stats['events_queued']}")
+            print(f"  Events sent:    {stats['events_sent']}")
+            print(f"  Batches sent:   {stats['batches_sent']}")
+            print(f"  Errors:         {stats['errors']}")
+            print(f"  Queue pending:  {stats['queue_size']}")
+            
+            # Flush remaining events (waits indefinitely)
+            if stats['queue_size'] > 0:
+                print(f"  Flushing {stats['queue_size']} pending events...")
+                g_send_helper.flush()
+            
             g_send_helper.close()
-            print("Event Hub connection closed")
         except Exception as e:
             print(f"WARNING: Error closing Event Hub: {e}")
         g_send_helper = None
@@ -811,22 +792,25 @@ def cleanup_event_hub():
 # =============================================================================
 
 def db_worker():
+    """Background worker that processes DB queue."""
     while True:
-        item = db_queue.get()
         try:
+            item = db_queue.get(timeout=1.0)
             frame_num, normal, pose = item
             process_detections_for_db(frame_num, normal, pose)
+        except Empty:
+            continue
         except Exception as e:
-            log.error(f"DB worker error: {e}")
+            print(f"DB worker error: {e}")
         finally:
-            db_queue.task_done()
+            try:
+                db_queue.task_done()
+            except ValueError:
+                pass
 
 
 def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_csv, enable_db):
     """Main entry point."""
-    db_thread = Thread(target=db_worker)
-    db_thread.start()
-
     global g_config
 
     Gst.init(None)
@@ -853,6 +837,10 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     # Initialize outputs
     init_csv()
     init_event_hub()
+    
+    # Start DB worker thread (daemon so it auto-exits)
+    db_thread = Thread(target=db_worker, daemon=True, name="DBWorker")
+    db_thread.start()
 
     # Print configuration
     print(f"\n{'='*50}")

@@ -4,13 +4,19 @@ send_helper.py - Helper class to send inference data to Event Hub
 This module provides a SendHelper class with methods to send messages
 to different tables (frame, person_observed, detection) via Azure Event Hub.
 The messages are consumed by writer.py which inserts them into PostgreSQL.
+
+OPTIMIZED VERSION: Uses async batching with background thread for high throughput.
 """
 
 import os
 import json
 import uuid
+import time
+import threading
+from collections import defaultdict
 from datetime import datetime
 from typing import Optional, Dict, List, Any
+from queue import Queue, Empty
 
 from dotenv import load_dotenv
 from azure.eventhub import EventHubProducerClient, EventData
@@ -18,10 +24,10 @@ from azure.eventhub import EventHubProducerClient, EventData
 
 class SendHelper:
     """
-    Helper class to send inference data to Azure Event Hub.
+    Helper class to send inference data to Azure Event Hub with batching.
     
-    Messages are structured with a 'table' field that indicates
-    the destination PostgreSQL table in writer.py.
+    Messages are buffered and sent in batches to improve throughput.
+    Uses a background thread to send events asynchronously.
     
     Supported tables:
         - frame: Video frame metadata
@@ -29,12 +35,21 @@ class SendHelper:
         - detection: Individual detection with bounding box and skeleton
     """
     
-    def __init__(self, env_file: Optional[str] = None):
+    def __init__(
+        self,
+        env_file: Optional[str] = None,
+        batch_size: int = 100,
+        flush_interval: float = 0.5,
+        max_queue_size: int = 50000,
+    ):
         """
         Initialize the SendHelper with Event Hub connection.
         
         Args:
             env_file: Path to .env file. If None, uses default .env
+            batch_size: Number of events to batch before sending
+            flush_interval: Max seconds to wait before flushing partial batch
+            max_queue_size: Maximum queue size before blocking
         """
         if env_file:
             load_dotenv(env_file)
@@ -56,22 +71,173 @@ class SendHelper:
             f"EntityPath={self.eventhub}"
         )
         
+        # Batching configuration
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        
+        # Internal queue for async sending
+        self._queue: Queue = Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._sender_thread: Optional[threading.Thread] = None
         self._producer: Optional[EventHubProducerClient] = None
+        
+        # Statistics
+        self._events_queued = 0
+        self._events_sent = 0
+        self._batches_sent = 0
+        self._errors = 0
+        self._lock = threading.Lock()
+        
+        # Start background sender thread
+        self._start_sender_thread()
     
-    @property
-    def producer(self) -> EventHubProducerClient:
-        """Lazy initialization of Event Hub producer."""
+    def _start_sender_thread(self):
+        """Start the background sender thread."""
+        self._sender_thread = threading.Thread(
+            target=self._sender_loop,
+            daemon=True,
+            name="EventHubSender"
+        )
+        self._sender_thread.start()
+    
+    def _get_producer(self) -> EventHubProducerClient:
+        """Get or create Event Hub producer."""
         if self._producer is None:
             self._producer = EventHubProducerClient.from_connection_string(
                 self._connection_str
             )
         return self._producer
     
+    def _sender_loop(self):
+        """Background thread that batches and sends events grouped by partition_key."""
+        buffer: List[Dict[str, Any]] = []
+        last_flush = time.time()
+        
+        while not self._stop_event.is_set():
+            try:
+                # Try to get an event with timeout
+                try:
+                    event = self._queue.get(timeout=0.1)
+                    buffer.append(event)
+                    self._queue.task_done()
+                except Empty:
+                    pass
+                
+                # Check if we should flush
+                should_flush = (
+                    len(buffer) >= self._batch_size or
+                    (buffer and time.time() - last_flush >= self._flush_interval)
+                )
+                
+                if should_flush and buffer:
+                    self._send_batch_by_partition(buffer)
+                    buffer = []
+                    last_flush = time.time()
+                    
+            except Exception as e:
+                print(f"ERROR in sender loop: {e}")
+                with self._lock:
+                    self._errors += 1
+                time.sleep(0.1)
+        
+        # Flush remaining events on shutdown
+        if buffer:
+            try:
+                self._send_batch_by_partition(buffer)
+            except Exception as e:
+                print(f"ERROR flushing final batch: {e}")
+    
+    def _send_batch_by_partition(self, events: List[Dict[str, Any]]):
+        """
+        Group events by partition_key and send each group as a separate batch.
+        This ensures events with the same partition_key maintain FIFO order.
+        """
+        if not events:
+            return
+        
+        # Group events by partition_key (defaultdict imported at top)
+        partitions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        
+        for event in events:
+            # Extract partition_key from event, default to "default"
+            pk = event.pop("_partition_key", "default")
+            partitions[pk].append(event)
+        
+        # Send each partition's events as a batch (maintains order within partition)
+        for partition_key, partition_events in partitions.items():
+            self._send_batch_internal(partition_events, partition_key)
+    
+    def _send_batch_internal(self, events: List[Dict[str, Any]], partition_key: Optional[str] = None):
+        """Actually send a batch of events to Event Hub with partition_key for ordering."""
+        if not events:
+            return
+            
+        try:
+            producer = self._get_producer()
+            # Create batch with partition_key to ensure FIFO ordering
+            batch = producer.create_batch(partition_key=partition_key)
+            events_in_batch = 0
+            
+            for event in events:
+                try:
+                    batch.add(EventData(json.dumps(event)))
+                    events_in_batch += 1
+                except ValueError:
+                    # Batch is full, send it and create a new one
+                    if events_in_batch > 0:
+                        producer.send_batch(batch)
+                        with self._lock:
+                            self._events_sent += events_in_batch
+                            self._batches_sent += 1
+                    batch = producer.create_batch(partition_key=partition_key)
+                    batch.add(EventData(json.dumps(event)))
+                    events_in_batch = 1
+            
+            # Send remaining events in batch
+            if events_in_batch > 0:
+                producer.send_batch(batch)
+                with self._lock:
+                    self._events_sent += events_in_batch
+                    self._batches_sent += 1
+                    
+        except Exception as e:
+            print(f"ERROR sending batch ({len(events)} events, pk={partition_key}): {e}")
+            with self._lock:
+                self._errors += 1
+    
     def close(self):
-        """Close the Event Hub producer connection."""
+        """
+        Close the Event Hub producer connection and stop sender thread.
+        
+        Waits indefinitely for all pending events to be sent.
+        Only call this on Ctrl+C / SIGTERM / docker stop.
+        """
+        pending = self._queue.qsize()
+        if pending > 0:
+            print(f"Closing SendHelper: waiting for {pending} pending events...")
+        
+        # Wait for queue to drain completely (no timeout)
+        while not self._queue.empty():
+            time.sleep(0.1)
+        
+        # Signal thread to stop
+        self._stop_event.set()
+        
+        # Wait for sender thread to finish (it will flush any remaining buffer)
+        if self._sender_thread and self._sender_thread.is_alive():
+            self._sender_thread.join()  # No timeout - wait indefinitely
+        
+        # Close producer
         if self._producer is not None:
-            self._producer.close()
+            try:
+                self._producer.close()
+            except Exception:
+                pass
             self._producer = None
+        
+        # Print stats
+        with self._lock:
+            print(f"SendHelper closed: {self._events_sent} events sent in {self._batches_sent} batches ({self._errors} errors)")
     
     def __enter__(self):
         return self
@@ -81,46 +247,26 @@ class SendHelper:
         return False
     
     # -------------------------------------------------------------------------
-    # Core send method
+    # Core queue method
     # -------------------------------------------------------------------------
-    def _send_event(self, payload: Dict[str, Any], partition_key: Optional[str] = None):
-        """
-        Send a single event to Event Hub.
-        
-        Args:
-            payload: Dictionary with data to send (must include 'table' field)
-            partition_key: Optional partition key for routing
-        """
-        batch = self.producer.create_batch(partition_key=partition_key)
-        batch.add(EventData(json.dumps(payload)))
-        
+    def _enqueue(self, payload: Dict[str, Any], partition_key: Optional[str] = None):
+        """Add an event to the send queue (non-blocking) with partition_key for ordering."""
+        # Store partition_key in payload for later extraction
         if partition_key:
-            self.producer.send_batch(batch)
-        else:
-            self.producer.send_batch(batch)
-    
-    def _send_batch(self, payloads: List[Dict[str, Any]], partition_key: Optional[str] = None):
-        """
-        Send multiple events to Event Hub in a single batch.
+            payload["_partition_key"] = partition_key
         
-        Args:
-            payloads: List of dictionaries to send
-            partition_key: Optional partition key for routing
-        """
-        if not payloads:
-            return
-            
-        batch = self.producer.create_batch()
-        for payload in payloads:
-            batch.add(EventData(json.dumps(payload)))
-        
-        if partition_key:
-            self.producer.send_batch(batch, partition_key=partition_key)
-        else:
-            self.producer.send_batch(batch)
+        try:
+            self._queue.put_nowait(payload)
+            with self._lock:
+                self._events_queued += 1
+        except Exception:
+            # Queue is full, block until space is available (no timeout)
+            self._queue.put(payload)  # Blocks indefinitely
+            with self._lock:
+                self._events_queued += 1
     
     # -------------------------------------------------------------------------
-    # Table-specific methods
+    # Table-specific methods (now queue-based for async sending)
     # -------------------------------------------------------------------------
     def send_frame(
         self,
@@ -131,20 +277,7 @@ class SendHelper:
         width: Optional[int] = None,
         height: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """
-        Send a frame record to Event Hub.
-        
-        Args:
-            frame_id: Unique identifier for the frame
-            camera_id: Camera identifier
-            timestamp: ISO format timestamp (defaults to current UTC time)
-            image_path: Path to the saved frame image
-            width: Frame width in pixels
-            height: Frame height in pixels
-            
-        Returns:
-            The payload that was sent
-        """
+        """Send a frame record to Event Hub (queued for async sending)."""
         if timestamp is None:
             timestamp = datetime.utcnow().isoformat() + "Z"
         
@@ -158,7 +291,7 @@ class SendHelper:
             "height": height,
         }
         
-        self._send_event(payload, partition_key=camera_id)
+        self._enqueue(payload)
         return payload
     
     def send_person_observed(
@@ -167,24 +300,14 @@ class SendHelper:
         age_group: Optional[str] = None,
         camera_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Send a person_observed record to Event Hub.
-        
-        Args:
-            person_id: Unique identifier for the tracked person
-            age_group: Age group classification (e.g., 'adult', 'child')
-            camera_id: Optional camera ID for partition routing
-            
-        Returns:
-            The payload that was sent
-        """
+        """Send a person_observed record to Event Hub (queued for async sending)."""
         payload = {
             "table": "person_observed",
             "id": person_id,
             "age_group": age_group,
         }
         
-        self._send_event(payload, partition_key=camera_id)
+        self._enqueue(payload)
         return payload
     
     def send_detection(
@@ -199,23 +322,7 @@ class SendHelper:
         real_geometry: Optional[str] = None,
         camera_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Send a detection record to Event Hub.
-        
-        Args:
-            detection_id: Unique identifier for this detection
-            frame_id: Reference to the parent frame
-            person_id: Reference to the tracked person
-            confidence: Detection confidence score (0.0 - 1.0)
-            bbox: Bounding box dict with keys: x, y, width, height
-            skeleton: List of keypoints for pose estimation
-            px_geometry: WKT geometry string for pixel coordinates
-            real_geometry: WKT geometry string for real-world coordinates
-            camera_id: Optional camera ID for partition routing
-            
-        Returns:
-            The payload that was sent
-        """
+        """Send a detection record to Event Hub (queued for async sending)."""
         payload = {
             "table": "detection",
             "id": detection_id,
@@ -228,165 +335,142 @@ class SendHelper:
             "real_geometry": real_geometry,
         }
         
-        self._send_event(payload, partition_key=camera_id)
+        self._enqueue(payload)
         return payload
     
     # -------------------------------------------------------------------------
-    # Convenience methods
+    # Bulk method for maximum efficiency
     # -------------------------------------------------------------------------
-    def send_full_detection(
+    def send_frame_with_detections(
         self,
+        frame_id: str,
         camera_id: str,
-        person_id: str,
-        confidence: float,
-        bbox: Optional[Dict[str, float]] = None,
-        skeleton: Optional[List[Dict[str, Any]]] = None,
-        timestamp: Optional[str] = None,
-        image_path: Optional[str] = None,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
-        age_group: Optional[str] = None,
-        px_geometry: Optional[str] = None,
-        real_geometry: Optional[str] = None,
-    ) -> Dict[str, str]:
-        """
-        Send a complete detection with frame and person records.
-        
-        This convenience method creates and sends all three related records:
-        frame, person_observed, and detection.
-        
-        Args:
-            camera_id: Camera identifier
-            person_id: Unique identifier for the tracked person
-            confidence: Detection confidence score
-            bbox: Bounding box dictionary
-            skeleton: Pose keypoints list
-            timestamp: ISO format timestamp
-            image_path: Path to saved frame image
-            width: Frame width
-            height: Frame height
-            age_group: Person age classification
-            px_geometry: Pixel coordinate geometry (WKT)
-            real_geometry: Real-world coordinate geometry (WKT)
-            
-        Returns:
-            Dictionary with generated IDs: frame_id, person_id, detection_id
-        """
-        frame_id = str(uuid.uuid4())
-        detection_id = str(uuid.uuid4())
-        
-        # Send all three records
-        self.send_frame(
-            frame_id=frame_id,
-            camera_id=camera_id,
-            timestamp=timestamp,
-            image_path=image_path,
-            width=width,
-            height=height,
-        )
-        
-        self.send_person_observed(
-            person_id=person_id,
-            age_group=age_group,
-            camera_id=camera_id,
-        )
-        
-        self.send_detection(
-            detection_id=detection_id,
-            frame_id=frame_id,
-            person_id=person_id,
-            confidence=confidence,
-            bbox=bbox,
-            skeleton=skeleton,
-            px_geometry=px_geometry,
-            real_geometry=real_geometry,
-            camera_id=camera_id,
-        )
-        
-        return {
-            "frame_id": frame_id,
-            "person_id": person_id,
-            "detection_id": detection_id,
-        }
-    
-    def send_batch_detections(
-        self,
+        timestamp: str,
+        width: int,
+        height: int,
         detections: List[Dict[str, Any]],
-        camera_id: str,
-        frame_id: Optional[str] = None,
-        timestamp: Optional[str] = None,
-        image_path: Optional[str] = None,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        track_to_person_id: Dict[int, str],
+    ) -> int:
         """
-        Send multiple detections for a single frame.
+        Send a frame and all its detections in one call.
+        
+        This is the most efficient method for sending detection data.
+        All events are queued together and will be batched by the sender thread.
+        
+        Uses frame_id as partition_key to allow parallel processing across frames,
+        while maintaining order within each frame (frame -> person -> detection).
+        
+        IMPORTANT: person_observed is sent with EVERY detection (idempotent).
+        This ensures person_observed always arrives with/before its detection,
+        regardless of partition ordering. The writer uses ON CONFLICT DO NOTHING.
         
         Args:
-            detections: List of detection dicts, each containing:
-                - person_id: str
-                - confidence: float
-                - bbox: Optional dict
-                - skeleton: Optional list
-                - age_group: Optional str
-                - px_geometry: Optional str (WKT)
-                - real_geometry: Optional str (WKT)
+            frame_id: Unique frame identifier (also used as partition_key)
             camera_id: Camera identifier
-            frame_id: Optional frame ID (generated if not provided)
             timestamp: ISO format timestamp
-            image_path: Path to saved frame image
             width: Frame width
             height: Frame height
-            
+            detections: List of detection dicts with keys:
+                - track_id: int
+                - confidence: float
+                - bbox: dict with x, y, width, height
+                - skeleton: optional list of keypoints
+            track_to_person_id: Mutable dict mapping track_id -> person_id
+                (will be updated with new tracks)
+        
         Returns:
-            Dictionary with frame_id and list of detection_ids
+            Number of events queued
         """
-        if frame_id is None:
-            frame_id = str(uuid.uuid4())
+        events_queued = 0
         
-        # Send frame first
-        self.send_frame(
-            frame_id=frame_id,
-            camera_id=camera_id,
-            timestamp=timestamp,
-            image_path=image_path,
-            width=width,
-            height=height,
-        )
+        # Use frame_id as partition_key for parallelism across frames
+        # All events for this frame go to the same partition (maintains order)
+        partition_key = frame_id
         
-        detection_ids = []
+        # Queue frame first
+        self._enqueue({
+            "table": "frame",
+            "id": frame_id,
+            "camera_id": camera_id,
+            "timestamp": timestamp,
+            "image_path": None,
+            "width": width,
+            "height": height,
+        }, partition_key=partition_key)
+        events_queued += 1
         
-        # Send each detection
+        # Process each detection
         for det in detections:
-            person_id = det.get("person_id", str(uuid.uuid4()))
-            detection_id = str(uuid.uuid4())
+            track_id = det["track_id"]
             
-            # Send person if needed
-            self.send_person_observed(
-                person_id=person_id,
-                age_group=det.get("age_group"),
-                camera_id=camera_id,
-            )
+            # Get or create person_id (track_to_person_id used for consistency)
+            if track_id not in track_to_person_id:
+                person_id = str(uuid.uuid4())
+                track_to_person_id[track_id] = person_id
+            else:
+                person_id = track_to_person_id[track_id]
             
-            # Send detection
-            self.send_detection(
-                detection_id=detection_id,
-                frame_id=frame_id,
-                person_id=person_id,
-                confidence=det.get("confidence", 0.0),
-                bbox=det.get("bbox"),
-                skeleton=det.get("skeleton"),
-                px_geometry=det.get("px_geometry"),
-                real_geometry=det.get("real_geometry"),
-                camera_id=camera_id,
-            )
+            # ALWAYS send person_observed (idempotent - ON CONFLICT DO NOTHING)
+            # This guarantees person exists before detection, regardless of partition order
+            self._enqueue({
+                "table": "person_observed",
+                "id": person_id,
+                "age_group": None,
+            }, partition_key=partition_key)
+            events_queued += 1
             
-            detection_ids.append(detection_id)
+            # Queue detection
+            self._enqueue({
+                "table": "detection",
+                "id": str(uuid.uuid4()),
+                "frame_id": frame_id,
+                "person_id": person_id,
+                "confidence": det.get("confidence", 0.0),
+                "bbox": det.get("bbox"),
+                "skeleton": det.get("skeleton"),
+                "px_geometry": None,
+                "real_geometry": None,
+            }, partition_key=partition_key)
+            events_queued += 1
         
-        return {
-            "frame_id": frame_id,
-            "detection_ids": detection_ids,
-        }
+        return events_queued
+    
+    # -------------------------------------------------------------------------
+    # Stats and control
+    # -------------------------------------------------------------------------
+    def get_stats(self) -> Dict[str, int]:
+        """Get sending statistics."""
+        with self._lock:
+            return {
+                "events_queued": self._events_queued,
+                "events_sent": self._events_sent,
+                "batches_sent": self._batches_sent,
+                "errors": self._errors,
+                "queue_size": self._queue.qsize(),
+            }
+    
+    def flush(self):
+        """
+        Wait for all queued events to be sent.
+        
+        Blocks indefinitely until queue is empty.
+        """
+        initial_size = self._queue.qsize()
+        
+        if initial_size > 0:
+            print(f"Flushing {initial_size} pending events...")
+        
+        while not self._queue.empty():
+            time.sleep(0.1)
+    
+    def print_stats(self):
+        """Print current statistics."""
+        stats = self.get_stats()
+        print(f"[SendHelper] Queued: {stats['events_queued']} | "
+              f"Sent: {stats['events_sent']} | "
+              f"Batches: {stats['batches_sent']} | "
+              f"Queue: {stats['queue_size']} | "
+              f"Errors: {stats['errors']}")
 
 
 # -----------------------------------------------------------------------------
@@ -403,117 +487,65 @@ def get_default_helper() -> SendHelper:
     return _default_helper
 
 
-def send_frame(**kwargs) -> Dict[str, Any]:
-    """Convenience function to send a frame record."""
-    return get_default_helper().send_frame(**kwargs)
-
-
-def send_person_observed(**kwargs) -> Dict[str, Any]:
-    """Convenience function to send a person_observed record."""
-    return get_default_helper().send_person_observed(**kwargs)
-
-
-def send_detection(**kwargs) -> Dict[str, Any]:
-    """Convenience function to send a detection record."""
-    return get_default_helper().send_detection(**kwargs)
-
-
-def send_full_detection(**kwargs) -> Dict[str, str]:
-    """Convenience function to send a complete detection with all records."""
-    return get_default_helper().send_full_detection(**kwargs)
+def close_default_helper():
+    """Close the default helper if it exists."""
+    global _default_helper
+    if _default_helper is not None:
+        _default_helper.close()
+        _default_helper = None
 
 
 # -----------------------------------------------------------------------------
 # Example usage / test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    import time
-    
     print("=" * 50)
-    print(" SendHelper Test")
+    print(" SendHelper Batching Test")
     print("=" * 50)
     
-    # Using context manager
-    with SendHelper() as helper:
+    with SendHelper(batch_size=50, flush_interval=0.5) as helper:
         camera_id = "-1"
+        track_to_person = {}
         
-        # Example 1: Send individual records
-        print("\n📤 Sending individual records...")
+        print("\n📤 Sending 100 frames with 5 detections each...")
+        start = time.time()
         
-        frame_id = str(uuid.uuid4())
-        person_id = f"track-{int(time.time())}"
-        detection_id = str(uuid.uuid4())
-        
-        helper.send_frame(
-            frame_id=frame_id,
-            camera_id=camera_id,
-            width=1920,
-            height=1080,
-        )
-        print(f"   ✅ Frame sent: {frame_id[:8]}...")
-        
-        helper.send_person_observed(
-            person_id=person_id,
-            age_group="adult",
-            camera_id=camera_id,
-        )
-        print(f"   ✅ Person sent: {person_id}")
-        
-        helper.send_detection(
-            detection_id=detection_id,
-            frame_id=frame_id,
-            person_id=person_id,
-            confidence=0.92,
-            bbox={"x": 100, "y": 200, "width": 50, "height": 120},
-            skeleton=[
-                {"name": "nose", "x": 125, "y": 210, "confidence": 0.95},
-                {"name": "left_eye", "x": 120, "y": 205, "confidence": 0.93},
-            ],
-            camera_id=camera_id,
-        )
-        print(f"   ✅ Detection sent: {detection_id[:8]}...")
-        
-        # Example 2: Send full detection (convenience method)
-        print("\n📤 Sending full detection...")
-        
-        ids = helper.send_full_detection(
-            camera_id=camera_id,
-            person_id=f"track-{int(time.time()) + 1}",
-            confidence=0.88,
-            bbox={"x": 300, "y": 150, "width": 60, "height": 140},
-            width=1920,
-            height=1080,
-            age_group="adult",
-        )
-        print(f"   ✅ Full detection sent:")
-        print(f"      Frame: {ids['frame_id'][:8]}...")
-        print(f"      Person: {ids['person_id']}")
-        print(f"      Detection: {ids['detection_id'][:8]}...")
-        
-        # Example 3: Send batch detections
-        print("\n📤 Sending batch detections...")
-        
-        batch_result = helper.send_batch_detections(
-            camera_id=camera_id,
-            width=1920,
-            height=1080,
-            detections=[
+        for frame_num in range(100):
+            frame_id = str(uuid.uuid4())
+            timestamp = datetime.utcnow().isoformat() + "Z"
+            
+            detections = [
                 {
-                    "person_id": f"track-batch-1",
-                    "confidence": 0.91,
-                    "bbox": {"x": 100, "y": 100, "width": 50, "height": 120},
-                },
-                {
-                    "person_id": f"track-batch-2",
-                    "confidence": 0.85,
-                    "bbox": {"x": 400, "y": 150, "width": 55, "height": 130},
-                },
-            ],
-        )
-        print(f"   ✅ Batch sent:")
-        print(f"      Frame: {batch_result['frame_id'][:8]}...")
-        print(f"      Detections: {len(batch_result['detection_ids'])}")
+                    "track_id": i,
+                    "confidence": 0.9,
+                    "bbox": {"x": 100 + i*50, "y": 100, "width": 50, "height": 120},
+                    "skeleton": None,
+                }
+                for i in range(5)
+            ]
+            
+            helper.send_frame_with_detections(
+                frame_id=frame_id,
+                camera_id=camera_id,
+                timestamp=timestamp,
+                width=1920,
+                height=1080,
+                detections=detections,
+                track_to_person_id=track_to_person,
+            )
+        
+        # Wait for all events to be sent
+        print("⏳ Flushing...")
+        helper.flush()
+        
+        elapsed = time.time() - start
+        stats = helper.get_stats()
+        
+        print(f"\n✅ Done in {elapsed:.2f}s")
+        print(f"   Events queued: {stats['events_queued']}")
+        print(f"   Events sent: {stats['events_sent']}")
+        print(f"   Batches sent: {stats['batches_sent']}")
+        if elapsed > 0:
+            print(f"   Throughput: {stats['events_sent']/elapsed:.0f} events/sec")
     
     print("\n" + "=" * 50)
-    print(" All events sent successfully!")
-    print("=" * 50)
