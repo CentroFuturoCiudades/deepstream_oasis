@@ -35,6 +35,15 @@ except ImportError:
     SEND_HELPER_AVAILABLE = False
     print("WARNING: send_helper not available. Database writes disabled.")
 
+# Import FrameUploader for Azure Blob Storage
+try:
+    from uploader import FrameUploader, get_frame_directory, DEFAULT_FRAME_DIR
+    UPLOADER_AVAILABLE = True
+except ImportError:
+    UPLOADER_AVAILABLE = False
+    DEFAULT_FRAME_DIR = "/tmp/frames"
+    print("WARNING: uploader not available. Frame uploads disabled.")
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -95,6 +104,11 @@ g_send_helper = None
 g_track_to_person_id = {}  # Maps track_id -> person_id (persists while script runs)
 
 db_queue = Queue(maxsize=10000)
+
+# Frame uploader state
+g_frame_uploader = None
+g_frame_dir = DEFAULT_FRAME_DIR  # Directory for temporary frame files
+g_pipeline_start_time = 0.0  # Pipeline start time (Unix timestamp) for PTS conversion
 
 # =============================================================================
 # FPS Tracker
@@ -341,10 +355,16 @@ def format_skeleton_for_db(keypoints):
     return skeleton
 
 
-def process_detections_for_db(frame_num, normal_detections, pose_detections):
+def process_detections_for_db(frame_num, normal_detections, pose_detections, timestamp_iso):
     """
     Process detections and send to Event Hub using efficient batched method.
     Uses send_frame_with_detections for optimal throughput.
+    
+    Args:
+        frame_num: Frame number
+        normal_detections: List of person detections
+        pose_detections: List of pose detections
+        timestamp_iso: ISO timestamp string (synchronized with frame capture)
     """
     global g_track_to_person_id, g_send_helper
     
@@ -356,9 +376,13 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
     
     # Generate frame record
     frame_id = str(uuid.uuid4())
-    timestamp = get_mexico_timestamp()
     width = g_config["width"]
     height = g_config["height"]
+    
+    # Generate image_path using the SAME timestamp as the saved frame file
+    # This ensures image_path in database matches the actual file in Azure
+    safe_timestamp = timestamp_iso.replace(":", "-").replace("+", "_")
+    image_path = f"{CAMERA_ID}/{safe_timestamp}.jpg" if g_frame_uploader else None
     
     # Prepare detections with bbox and skeleton in correct format
     prepared_detections = []
@@ -384,12 +408,38 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
     g_send_helper.send_frame_with_detections(
         frame_id=frame_id,
         camera_id=CAMERA_ID,
-        timestamp=timestamp,
+        timestamp=timestamp_iso,
         width=width,
         height=height,
         detections=prepared_detections,
         track_to_person_id=g_track_to_person_id,
+        image_path=image_path,
     )
+
+
+def pts_to_timestamp(pts_ns):
+    """
+    Convert GStreamer PTS (nanoseconds) to ISO timestamp string.
+    
+    Uses the pipeline start time as reference and adds the PTS offset.
+    This ensures that the same PTS value always produces the same timestamp,
+    which is critical for synchronizing frame files with database records.
+    
+    Args:
+        pts_ns: Presentation timestamp in nanoseconds
+        
+    Returns:
+        ISO format timestamp string in Mexico City timezone
+    """
+    global g_pipeline_start_time
+    
+    # Convert PTS from nanoseconds to seconds and add to pipeline start time
+    pts_sec = pts_ns / 1_000_000_000.0
+    frame_time = g_pipeline_start_time + pts_sec
+    
+    # Convert to datetime in Mexico timezone
+    dt = datetime.fromtimestamp(frame_time, tz=MEXICO_TZ)
+    return dt.isoformat()
 
 
 def osd_buffer_probe(pad, info, user_data):
@@ -417,8 +467,9 @@ def osd_buffer_probe(pad, info, user_data):
                 break
             continue
 
-        print(frame_meta.frame_num)
-
+        # Generate timestamp from PTS - same PTS used for frame capture
+        # This ensures the timestamp in DB matches the frame filename
+        timestamp_iso = pts_to_timestamp(frame_meta.buf_pts)
 
         # Separate detections by type
         normal_detections = []
@@ -470,11 +521,13 @@ def osd_buffer_probe(pad, info, user_data):
                 g_csv_writer.writerow(row)
         
         # Send detections to database via Event Hub (non-blocking queue)
+        # Pass timestamp_iso for synchronized timing with frame capture
         try:
             db_queue.put_nowait((
                 frame_meta.frame_num,
                 normal_detections,
-                pose_detections
+                pose_detections,
+                timestamp_iso  # Pass synchronized timestamp
             ))
         except:
             pass  # Queue full, drop silently to avoid blocking pipeline
@@ -557,6 +610,73 @@ def stop_pipeline(pipeline, loop):
 
 
 # =============================================================================
+# Frame Capture (appsink callback)
+# =============================================================================
+
+g_frame_counter = 0  # Counter for frame capture frequency
+
+def on_new_frame_sample(appsink):
+    """
+    Callback for appsink when a new JPEG frame is available.
+    
+    Saves the JPEG data to /tmp/frames/{timestamp}.jpg
+    The uploader monitors this directory and uploads files to Azure.
+    
+    Uses PTS (Presentation Timestamp) to generate the filename, ensuring
+    the timestamp matches what's sent to the database.
+    """
+    global g_frame_counter
+    
+    # Only capture every INFER_STRIDE frames
+    g_frame_counter += 1
+    if g_frame_counter % INFER_STRIDE != 0:
+        return Gst.FlowReturn.OK
+    
+    try:
+        sample = appsink.emit("pull-sample")
+        if not sample:
+            return Gst.FlowReturn.OK
+        
+        buffer = sample.get_buffer()
+        if not buffer:
+            return Gst.FlowReturn.OK
+        
+        # Get PTS and convert to timestamp
+        pts_ns = buffer.pts
+        if pts_ns == Gst.CLOCK_TIME_NONE:
+            # Fallback to current time if PTS not available
+            timestamp_iso = get_mexico_timestamp()
+        else:
+            timestamp_iso = pts_to_timestamp(pts_ns)
+        
+        # Sanitize timestamp for filename
+        safe_timestamp = timestamp_iso.replace(":", "-").replace("+", "_")
+        
+        # Extract JPEG bytes from buffer
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
+        
+        try:
+            jpeg_bytes = bytes(map_info.data)
+            
+            # Save to file
+            file_path = os.path.join(g_frame_dir, f"{safe_timestamp}.jpg")
+            with open(file_path, "wb") as f:
+                f.write(jpeg_bytes)
+                
+        finally:
+            buffer.unmap(map_info)
+        
+    except Exception as e:
+        # Log only occasionally to avoid spam
+        if g_frame_counter < 100 or g_frame_counter % 300 == 0:
+            print(f"WARNING: Frame capture error: {e}")
+    
+    return Gst.FlowReturn.OK
+
+
+# =============================================================================
 # Pipeline Construction
 # =============================================================================
 
@@ -623,17 +743,48 @@ def build_pipeline(source_uri, infer_config, output_path):
     pgie = create_element("nvinfer", "pgie")
     tracker = create_element("nvtracker", "tracker")
     sgie = create_element("nvinfer", "sgie")
-    converter1 = create_element("nvvideoconvert", "converter1")
-    capsfilter = create_element("capsfilter", "capsfilter")
-    osd = create_element("nvdsosd", "osd")
-    converter2 = create_element("nvvideoconvert", "converter2")
-    encoder = create_element("nvv4l2h264enc", "encoder")
-    parser = create_element("h264parse", "parser")
-    muxer = create_element("qtmux", "muxer")
-    sink = create_element("filesink", "sink")
+    
+    # TEE element to split stream: one for frame capture, one for output
+    tee = create_element("tee", "tee")
+    
+    # Frame capture branch (clean frames without OSD overlays)
+    # sgie -> tee -> queue_capture -> conv_capture -> nvjpegenc -> appsink
+    use_frame_capture = UPLOADER_AVAILABLE and g_config.get("enable_db", False)
+    queue_capture = create_element("queue", "queue_capture") if use_frame_capture else None
+    conv_capture = create_element("nvvideoconvert", "conv_capture") if use_frame_capture else None
+    jpegenc = create_element("nvjpegenc", "jpegenc") if use_frame_capture else None
+    appsink = Gst.ElementFactory.make("appsink", "appsink") if use_frame_capture else None
+    
+    # Output branch (with OSD overlays) - only if output_path is provided
+    use_output = output_path is not None
+    queue_output = create_element("queue", "queue_output") if use_output else None
+    converter1 = create_element("nvvideoconvert", "converter1") if use_output else None
+    capsfilter = create_element("capsfilter", "capsfilter") if use_output else None
+    osd = create_element("nvdsosd", "osd") if use_output else None
+    converter2 = create_element("nvvideoconvert", "converter2") if use_output else None
+    encoder = create_element("nvv4l2h264enc", "encoder") if use_output else None
+    parser = create_element("h264parse", "parser") if use_output else None
+    muxer = create_element("qtmux", "muxer") if use_output else None
+    sink = create_element("filesink", "sink") if use_output else None
+    
+    # No-output branch: still need OSD for the probe, then drop frames
+    if not use_output:
+        queue_noop = create_element("queue", "queue_noop")
+        osd = create_element("nvdsosd", "osd")
+        fakesink = create_element("fakesink", "fakesink")
 
-    elements = [streammux, source, pgie, tracker, sgie, converter1,
-                capsfilter, osd, converter2, encoder, parser, muxer, sink]
+    # Base elements (always required)
+    elements = [streammux, source, pgie, tracker, sgie, tee, osd]
+    
+    # Add frame capture elements
+    if use_frame_capture and all([queue_capture, conv_capture, jpegenc, appsink]):
+        elements.extend([queue_capture, conv_capture, jpegenc, appsink])
+    
+    # Add output elements
+    if use_output:
+        elements.extend([queue_output, converter1, capsfilter, converter2, encoder, parser, muxer, sink])
+    else:
+        elements.extend([queue_noop, fakesink])
 
     if not all(elements):
         return None, "Failed to create pipeline elements"
@@ -665,15 +816,33 @@ def build_pipeline(source_uri, infer_config, output_path):
     # Configure OSD
     osd.set_property("process-mode", int(pyds.MODE_GPU))
     osd.set_property("qos", 0)
-
-    # Configure encoder input caps
-    caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
-    capsfilter.set_property("caps", caps)
-
-    # Configure output
-    sink.set_property("location", output_path)
-    sink.set_property("sync", 0)
-    sink.set_property("async", 0)
+    
+    # Configure frame capture branch
+    if use_frame_capture and jpegenc and appsink:
+        # JPEG encoder quality (1-100)
+        jpegenc.set_property("quality", 85)
+        
+        # Configure appsink for async callback
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("max-buffers", 3)
+        appsink.set_property("drop", True)
+        appsink.set_property("sync", False)
+        appsink.connect("new-sample", on_new_frame_sample)
+    
+    # Configure output branch
+    if use_output:
+        # Configure encoder input caps (NV12 for H264 encoding)
+        caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
+        capsfilter.set_property("caps", caps)
+        
+        # Configure output
+        sink.set_property("location", output_path)
+        sink.set_property("sync", 0)
+        sink.set_property("async", 0)
+    else:
+        # Fakesink for when no output
+        fakesink.set_property("sync", False)
+        fakesink.set_property("async", False)
 
     # GPU-specific settings for dGPU
     if not g_config["is_jetson"]:
@@ -685,32 +854,79 @@ def build_pipeline(source_uri, infer_config, output_path):
         pgie.set_property("gpu_id", gpu)
         sgie.set_property("gpu_id", gpu)
         tracker.set_property("gpu-id", gpu)
-        converter1.set_property("nvbuf-memory-type", mem_type)
-        converter1.set_property("gpu_id", gpu)
+        
+        # Frame capture branch GPU settings
+        if use_frame_capture and conv_capture:
+            conv_capture.set_property("nvbuf-memory-type", mem_type)
+            conv_capture.set_property("gpu_id", gpu)
+        
+        # OSD GPU settings
         osd.set_property("gpu_id", gpu)
-        converter2.set_property("nvbuf-memory-type", mem_type)
-        converter2.set_property("gpu_id", gpu)
-        try_set_property(encoder, "gpu-id", gpu)
-        try_set_property(encoder, "bufapi-version", 1)
+        
+        # Output branch GPU settings
+        if use_output:
+            converter1.set_property("nvbuf-memory-type", mem_type)
+            converter1.set_property("gpu_id", gpu)
+            converter2.set_property("nvbuf-memory-type", mem_type)
+            converter2.set_property("gpu_id", gpu)
+            try_set_property(encoder, "gpu-id", gpu)
+            try_set_property(encoder, "bufapi-version", 1)
 
-    # Encoder settings
-    try_set_property(encoder, "bitrate", 8000000)
-    try_set_property(encoder, "insert-sps-pps", 1)
-    try_set_property(encoder, "iframeinterval", 30)
-    try_set_property(encoder, "profile", 0)
+    # Encoder settings (only if output is enabled)
+    if use_output:
+        try_set_property(encoder, "bitrate", 8000000)
+        try_set_property(encoder, "insert-sps-pps", 1)
+        try_set_property(encoder, "iframeinterval", 30)
+        try_set_property(encoder, "profile", 0)
 
-    # Link pipeline
-    links = [
-        (streammux, pgie), (pgie, tracker), (tracker, sgie), (sgie, converter1),
-        (converter1, capsfilter), (capsfilter, osd), (osd, converter2),
-        (converter2, encoder), (encoder, parser), (parser, muxer), (muxer, sink)
-    ]
+    # Link pipeline elements
+    # Main chain: streammux -> pgie -> tracker -> sgie -> tee
+    main_chain = [streammux, pgie, tracker, sgie, tee]
+    for i in range(len(main_chain) - 1):
+        if not main_chain[i].link(main_chain[i + 1]):
+            return None, f"Failed to link {main_chain[i].get_name()} -> {main_chain[i + 1].get_name()}"
+    
+    # Link tee to frame capture branch (clean frames)
+    if use_frame_capture and all([queue_capture, conv_capture, jpegenc, appsink]):
+        # Get tee src pad
+        tee_src_capture = tee.request_pad_simple("src_%u")
+        queue_capture_sink = queue_capture.get_static_pad("sink")
+        if tee_src_capture.link(queue_capture_sink) != Gst.PadLinkReturn.OK:
+            return None, "Failed to link tee to queue_capture"
+        
+        # Link capture branch: queue_capture -> conv_capture -> jpegenc -> appsink
+        capture_chain = [queue_capture, conv_capture, jpegenc, appsink]
+        for i in range(len(capture_chain) - 1):
+            if not capture_chain[i].link(capture_chain[i + 1]):
+                return None, f"Failed to link {capture_chain[i].get_name()} -> {capture_chain[i + 1].get_name()}"
+    
+    # Link tee to output branch (with OSD overlays)
+    if use_output:
+        # Get tee src pad
+        tee_src_output = tee.request_pad_simple("src_%u")
+        queue_output_sink = queue_output.get_static_pad("sink")
+        if tee_src_output.link(queue_output_sink) != Gst.PadLinkReturn.OK:
+            return None, "Failed to link tee to queue_output"
+        
+        # Link output branch: queue_output -> osd -> converter1 -> capsfilter -> converter2 -> encoder -> parser -> muxer -> sink
+        output_chain = [queue_output, osd, converter1, capsfilter, converter2, encoder, parser, muxer, sink]
+        for i in range(len(output_chain) - 1):
+            if not output_chain[i].link(output_chain[i + 1]):
+                return None, f"Failed to link {output_chain[i].get_name()} -> {output_chain[i + 1].get_name()}"
+    else:
+        # Link tee to queue_noop to OSD to fakesink (for probe to work)
+        tee_src_output = tee.request_pad_simple("src_%u")
+        queue_noop_sink = queue_noop.get_static_pad("sink")
+        if tee_src_output.link(queue_noop_sink) != Gst.PadLinkReturn.OK:
+            return None, "Failed to link tee to queue_noop"
+        
+        # Link: queue_noop -> osd -> fakesink
+        noop_chain = [queue_noop, osd, fakesink]
+        for i in range(len(noop_chain) - 1):
+            if not noop_chain[i].link(noop_chain[i + 1]):
+                return None, f"Failed to link {noop_chain[i].get_name()} -> {noop_chain[i + 1].get_name()}"
 
-    for src, dst in links:
-        if not src.link(dst):
-            return None, f"Failed to link {src.get_name()} -> {dst.get_name()}"
-
-    # Add probe for processing
+    # Add probe AFTER OSD sink for processing (detections, visualization)
     osd_pad = osd.get_static_pad("sink")
     if not osd_pad:
         return None, "Failed to get OSD sink pad"
@@ -761,6 +977,53 @@ def init_event_hub():
         g_send_helper = None
 
 
+def init_frame_uploader():
+    """Initialize Azure Blob Storage uploader for frames."""
+    global g_frame_uploader, g_frame_dir
+    
+    if not g_config["enable_db"]:
+        return
+    
+    if not UPLOADER_AVAILABLE:
+        print("WARNING: FrameUploader not available. Frame uploads disabled.")
+        return
+    
+    try:
+        # Ensure frame directory exists
+        os.makedirs(g_frame_dir, exist_ok=True)
+        
+        g_frame_uploader = FrameUploader(
+            container_name="oasis-ds",
+            frame_dir=g_frame_dir,
+            camera_id=CAMERA_ID,
+            num_workers=2,
+        )
+        print(f"Frame uploader initialized (container=container-ds, dir={g_frame_dir})")
+    except Exception as e:
+        print(f"WARNING: Failed to initialize frame uploader: {e}")
+        print("Frame uploads disabled (metadata will still be sent).")
+        g_frame_uploader = None
+
+
+def cleanup_frame_uploader():
+    """Close frame uploader and print stats."""
+    global g_frame_uploader
+    
+    if g_frame_uploader is not None:
+        try:
+            stats = g_frame_uploader.get_stats()
+            print(f"\n[Frame Uploader Stats]")
+            print(f"  Frames queued:   {stats['frames_queued']}")
+            print(f"  Frames uploaded: {stats['frames_uploaded']}")
+            print(f"  Errors:          {stats['errors']}")
+            print(f"  Queue pending:   {stats['queue_size']}")
+            
+            g_frame_uploader.close()
+        except Exception as e:
+            print(f"WARNING: Error closing frame uploader: {e}")
+        g_frame_uploader = None
+
+
 def cleanup_event_hub():
     """Close Event Hub connection and print stats."""
     global g_send_helper
@@ -796,8 +1059,13 @@ def db_worker():
     while True:
         try:
             item = db_queue.get(timeout=1.0)
-            frame_num, normal, pose = item
-            process_detections_for_db(frame_num, normal, pose)
+            # Unpack: frame_num, normal, pose, timestamp_iso
+            if len(item) == 4:
+                frame_num, normal, pose, timestamp_iso = item
+            else:
+                frame_num, normal, pose = item
+                timestamp_iso = get_mexico_timestamp()  # Fallback
+            process_detections_for_db(frame_num, normal, pose, timestamp_iso)
         except Empty:
             continue
         except Exception as e:
@@ -811,7 +1079,7 @@ def db_worker():
 
 def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_csv, enable_db):
     """Main entry point."""
-    global g_config
+    global g_config, g_pipeline_start_time
 
     Gst.init(None)
 
@@ -821,6 +1089,9 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     g_config["is_jetson"] = is_jetson()
     g_config["enable_csv"] = enable_csv
     g_config["enable_db"] = enable_db
+    
+    # Record pipeline start time for PTS to timestamp conversion
+    g_pipeline_start_time = time.time()
 
     # Build pipeline
     pipeline, error = build_pipeline(source_uri, infer_config, output_path)
@@ -837,6 +1108,7 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     # Initialize outputs
     init_csv()
     init_event_hub()
+    init_frame_uploader()
     
     # Start DB worker thread (daemon so it auto-exits)
     db_thread = Thread(target=db_worker, daemon=True, name="DBWorker")
@@ -846,12 +1118,14 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     print(f"\n{'='*50}")
     print(f"SOURCE:    {source_uri}")
     print(f"CONFIG:    {infer_config}")
-    print(f"OUTPUT:    {output_path}")
+    print(f"OUTPUT:    {output_path if output_path else 'disabled'}")
     print(f"SIZE:      {width}x{height}")
     print(f"GPU:       {gpu_id}")
     print(f"JETSON:    {g_config['is_jetson']}")
     print(f"CSV:       {'enabled' if g_config['enable_csv'] else 'disabled'}")
     print(f"DATABASE:  {'enabled' if g_config['enable_db'] else 'disabled'}")
+    print(f"UPLOADER:  {'enabled' if g_frame_uploader else 'disabled'}")
+    print(f"FRAME_DIR: {g_frame_dir}")
     print(f"CAMERA_ID: {CAMERA_ID}")
     print(f"{'='*50}\n")
 
@@ -873,8 +1147,8 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     if g_csv_file:
         g_csv_file.close()
     
-
-    print(f"\nOutput saved: {output_path}")
+    if output_path:
+        print(f"\nOutput saved: {output_path}")
     if g_config["enable_csv"]:
         print(f"Metadata saved: {CSV_PATH}")
     if g_config["enable_db"]:
@@ -885,6 +1159,7 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     print("Waiting for DB queue to flush...")
     db_queue.join()
     print("All DB events sent")
+    cleanup_frame_uploader()
     cleanup_event_hub()
 
     return 0
@@ -899,8 +1174,8 @@ def parse_args():
                         help="Source URI (file:///... or rtsp://...)")
     parser.add_argument("-c", "--config", default=DEFAULT_INFER_CONFIG,
                         help="Primary inference config path")
-    parser.add_argument("-o", "--output", default=OUTPUT_MP4,
-                        help="Output MP4 path")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Output MP4 path (optional, no output if not specified)")
     parser.add_argument("-W", "--width", type=int, default=STREAMMUX_WIDTH,
                         help="Processing width")
     parser.add_argument("-H", "--height", type=int, default=STREAMMUX_HEIGHT,

@@ -350,6 +350,7 @@ class SendHelper:
         height: int,
         detections: List[Dict[str, Any]],
         track_to_person_id: Dict[int, str],
+        image_path: Optional[str] = None,
     ) -> int:
         """
         Send a frame and all its detections in one call.
@@ -377,6 +378,7 @@ class SendHelper:
                 - skeleton: optional list of keypoints
             track_to_person_id: Mutable dict mapping track_id -> person_id
                 (will be updated with new tracks)
+            image_path: Optional path to frame image in blob storage
         
         Returns:
             Number of events queued
@@ -393,7 +395,7 @@ class SendHelper:
             "id": frame_id,
             "camera_id": camera_id,
             "timestamp": timestamp,
-            "image_path": None,
+            "image_path": image_path,
             "width": width,
             "height": height,
         }, partition_key=partition_key)
