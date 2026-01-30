@@ -2,7 +2,7 @@
 send_helper.py - Helper class to send inference data to Event Hub
 
 This module provides a SendHelper class with methods to send messages
-to different tables (frame, person_observed, detection) via Azure Event Hub.
+to different tables (video_event, person_observed, detection) via Azure Event Hub.
 The messages are consumed by writer.py which inserts them into PostgreSQL.
 
 OPTIMIZED VERSION: Uses async batching with background thread for high throughput.
@@ -30,7 +30,7 @@ class SendHelper:
     Uses a background thread to send events asynchronously.
     
     Supported tables:
-        - frame: Video frame metadata
+        - video_event: Video event metadata
         - person_observed: Tracked person information
         - detection: Individual detection with bounding box and skeleton
     """
@@ -268,25 +268,25 @@ class SendHelper:
     # -------------------------------------------------------------------------
     # Table-specific methods (now queue-based for async sending)
     # -------------------------------------------------------------------------
-    def send_frame(
+    def send_video(
         self,
-        frame_id: str,
+        video_id: str,
         camera_id: str,
         timestamp: Optional[str] = None,
-        image_path: Optional[str] = None,
+        video_path: Optional[str] = None,
         width: Optional[int] = None,
         height: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Send a frame record to Event Hub (queued for async sending)."""
+        """Send a video record to Event Hub (queued for async sending)."""
         if timestamp is None:
             timestamp = datetime.utcnow().isoformat() + "Z"
         
         payload = {
-            "table": "frame",
-            "id": frame_id,
+            "table": "video_event",
+            "id": video_id,
             "camera_id": camera_id,
-            "timestamp": timestamp,
-            "image_path": image_path,
+            "start_ts": timestamp,
+            "video_path": video_path,
             "width": width,
             "height": height,
         }
@@ -313,7 +313,7 @@ class SendHelper:
     def send_detection(
         self,
         detection_id: str,
-        frame_id: str,
+        video_id: str,
         person_id: str,
         confidence: float,
         bbox: Optional[Dict[str, float]] = None,
@@ -326,8 +326,8 @@ class SendHelper:
         payload = {
             "table": "detection",
             "id": detection_id,
-            "frame_id": frame_id,
             "person_id": person_id,
+            "video_event_id": video_id,
             "confidence": confidence,
             "bbox": bbox,
             "skeleton": skeleton,
@@ -344,6 +344,7 @@ class SendHelper:
     def send_frame_with_detections(
         self,
         frame_id: str,
+        video_id: str,
         camera_id: str,
         timestamp: str,
         width: int,
@@ -352,24 +353,24 @@ class SendHelper:
         track_to_person_id: Dict[int, str],
     ) -> int:
         """
-        Send a frame and all its detections in one call.
+        Send a all frame detections from a video in one call.
         
         This is the most efficient method for sending detection data.
         All events are queued together and will be batched by the sender thread.
         
-        Uses frame_id as partition_key to allow parallel processing across frames,
-        while maintaining order within each frame (frame -> person -> detection).
+        Uses video_id as partition_key to allow parallel processing across videos,
+        while maintaining order within each video (video -> person -> detection).
         
         IMPORTANT: person_observed is sent with EVERY detection (idempotent).
         This ensures person_observed always arrives with/before its detection,
         regardless of partition ordering. The writer uses ON CONFLICT DO NOTHING.
         
         Args:
-            frame_id: Unique frame identifier (also used as partition_key)
+            video_id: Unique video identifier (also used as partition_key)
             camera_id: Camera identifier
             timestamp: ISO format timestamp
-            width: Frame width
-            height: Frame height
+            width: Video width
+            height: Video height
             detections: List of detection dicts with keys:
                 - track_id: int
                 - confidence: float
@@ -383,17 +384,17 @@ class SendHelper:
         """
         events_queued = 0
         
-        # Use frame_id as partition_key for parallelism across frames
-        # All events for this frame go to the same partition (maintains order)
-        partition_key = frame_id
+        # Use video_id as partition_key for parallelism across videos
+        # All events for this video go to the same partition (maintains order)
+        partition_key = video_id
         
-        # Queue frame first
+        # Queue video first
         self._enqueue({
-            "table": "frame",
-            "id": frame_id,
+            "table": "video_event",
+            "id": video_id,
             "camera_id": camera_id,
-            "timestamp": timestamp,
-            "image_path": None,
+            "start_ts": timestamp,
+            "video_path": f"{timestamp}.mp4",
             "width": width,
             "height": height,
         }, partition_key=partition_key)
@@ -423,8 +424,9 @@ class SendHelper:
             self._enqueue({
                 "table": "detection",
                 "id": str(uuid.uuid4()),
-                "frame_id": frame_id,
                 "person_id": person_id,
+                "video_event_id": video_id,
+                "timestamp": timestamp,
                 "confidence": det.get("confidence", 0.0),
                 "bbox": det.get("bbox"),
                 "skeleton": det.get("skeleton"),
@@ -494,58 +496,79 @@ def close_default_helper():
         _default_helper.close()
         _default_helper = None
 
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Example usage / test
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 50)
-    print(" SendHelper Batching Test")
+    print(" SendHelper Realistic Streaming Test (3 videos x 10 frames each) ")
     print("=" * 50)
-    
+
     with SendHelper(batch_size=50, flush_interval=0.5) as helper:
         camera_id = "-1"
-        track_to_person = {}
-        
-        print("\n📤 Sending 100 frames with 5 detections each...")
+        track_to_person_per_video: Dict[str, Dict[int, str]] = {}
+
+        num_videos = 3
+        frames_per_video = 10
+        detections_per_frame = 5
+
+        print(f"\n📤 Sending {frames_per_video} frames for {num_videos} videos...")
+
         start = time.time()
-        
-        for frame_num in range(100):
-            frame_id = str(uuid.uuid4())
-            timestamp = datetime.utcnow().isoformat() + "Z"
-            
-            detections = [
-                {
-                    "track_id": i,
-                    "confidence": 0.9,
-                    "bbox": {"x": 100 + i*50, "y": 100, "width": 50, "height": 120},
-                    "skeleton": None,
-                }
-                for i in range(5)
-            ]
-            
-            helper.send_frame_with_detections(
-                frame_id=frame_id,
+
+        for vid_num in range(num_videos):
+            video_id = str(uuid.uuid4())
+            # send video record
+            helper.send_video(
+                video_id=video_id,
                 camera_id=camera_id,
-                timestamp=timestamp,
+                timestamp=datetime.utcnow().isoformat() + "Z",
+                video_path=f"{video_id}.mp4",   
                 width=1920,
                 height=1080,
-                detections=detections,
-                track_to_person_id=track_to_person,
             )
-        
-        # Wait for all events to be sent
+            helper.flush()
+
+            track_to_person_per_video[video_id] = {}
+
+            for frame_num in range(frames_per_video):
+                frame_id = str(uuid.uuid4())
+                timestamp = datetime.utcnow().isoformat() + "Z"
+
+                # Crear detecciones simuladas
+                detections = [
+                    {
+                        "track_id": i,
+                        "confidence": 0.9,
+                        "bbox": {"x": 100 + i*50, "y": 100, "width": 50, "height": 120},
+                        "skeleton": None,
+                    }
+                    for i in range(detections_per_frame)
+                ]
+
+                # Enviar frame + detecciones
+                helper.send_frame_with_detections(
+                    frame_id=frame_id,
+                    video_id=video_id,
+                    camera_id=camera_id,
+                    timestamp=timestamp,
+                    width=1920,
+                    height=1080,
+                    detections=detections,
+                    track_to_person_id=track_to_person_per_video[video_id],
+                )
+
         print("⏳ Flushing...")
         helper.flush()
-        
+
         elapsed = time.time() - start
         stats = helper.get_stats()
-        
+
         print(f"\n✅ Done in {elapsed:.2f}s")
         print(f"   Events queued: {stats['events_queued']}")
         print(f"   Events sent: {stats['events_sent']}")
         print(f"   Batches sent: {stats['batches_sent']}")
         if elapsed > 0:
             print(f"   Throughput: {stats['events_sent']/elapsed:.0f} events/sec")
-    
+
     print("\n" + "=" * 50)
