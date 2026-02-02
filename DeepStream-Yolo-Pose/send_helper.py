@@ -394,7 +394,7 @@ class SendHelper:
             "id": video_id,
             "camera_id": camera_id,
             "start_ts": timestamp,
-            "video_path": f"{timestamp}.mp4",
+            "video_path": f"{camera_id}/{timestamp}.mp4",
             "width": width,
             "height": height,
         }, partition_key=partition_key)

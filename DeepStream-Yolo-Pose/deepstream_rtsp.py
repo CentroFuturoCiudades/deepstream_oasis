@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 DeepStream YOLO11 + Pose estimation pipeline.
 Processes video sources and outputs annotated MP4 with bounding boxes and pose keypoints.
@@ -22,6 +21,7 @@ from datetime import datetime, timezone, timedelta
 from threading import Lock, Thread
 from ctypes import sizeof, c_float
 from queue import Queue, Empty
+from uploader import Uploader
 
 sys.path.append("/opt/nvidia/deepstream/deepstream/lib")
 import pyds
@@ -38,6 +38,15 @@ except ImportError:
 # =============================================================================
 # Configuration
 # =============================================================================
+g_splitmuxsink = None
+
+# videos
+recording = False
+frames_without_detections = 0
+video_id = None
+video_path = None
+recording_frames = 0
+MAX_NO_DET_FRAMES = 10
 
 DEFAULT_SOURCE = "file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
 DEFAULT_INFER_CONFIG = os.path.abspath("config_infer_primary_yolo11.txt")
@@ -56,11 +65,12 @@ GPU_ID = 0
 MAX_DISPLAY_ELEMENTS = 16
 NUM_KEYPOINTS = 17
 FPS_INTERVAL_SEC = 5
-RTSP_TIMEOUT_SEC = 10
-INFER_STRIDE = 3
+RTSP_TIMEOUT_SEC = 30
+INFER_STRIDE = 3  # Process every Nth frame for inference
+MAX_RECORDING_FRAMES = FPS_INTERVAL_SEC * 60 * 3 # 3 minutes
 
 # Event Hub / Database Configuration
-CAMERA_ID = "-1"  # Hardcoded camera ID
+CAMERA_ID = "3"  # Hardcoded camera ID
 EH_MAX_RETRIES = 3
 EH_RETRY_DELAY = 0.5  # seconds
 
@@ -282,22 +292,6 @@ def get_mexico_timestamp():
     return datetime.now(MEXICO_TZ).isoformat()
 
 
-def send_to_event_hub_with_retry(func, *args, **kwargs):
-    """
-    Execute a send function with retry logic.
-    Retries up to EH_MAX_RETRIES times, logs errors, and continues.
-    """
-    for attempt in range(EH_MAX_RETRIES):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if attempt < EH_MAX_RETRIES - 1:
-                time.sleep(EH_RETRY_DELAY)
-            else:
-                print(f"ERROR: Failed to send to Event Hub after {EH_MAX_RETRIES} attempts: {e}")
-    return None
-
-
 def format_bbox_for_db(bbox_tuple):
     """
     Convert bbox tuple (x, y, w, h) to dict format for database.
@@ -341,7 +335,7 @@ def format_skeleton_for_db(keypoints):
     return skeleton
 
 
-def process_detections_for_db(frame_num, normal_detections, pose_detections):
+def process_detections_for_db(frame_num, video_id, normal_detections, pose_detections, timestamp):
     """
     Process detections and send to Event Hub using efficient batched method.
     Uses send_frame_with_detections for optimal throughput.
@@ -354,12 +348,8 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
     if not normal_detections:
         return
     
-    # Generate frame record
-    frame_id = str(uuid.uuid4())
-    timestamp = get_mexico_timestamp()
     width = g_config["width"]
     height = g_config["height"]
-    
     # Prepare detections with bbox and skeleton in correct format
     prepared_detections = []
     for det in normal_detections:
@@ -382,7 +372,8 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
     # Send all at once using the efficient bulk method
     # This queues all events for async batched sending
     g_send_helper.send_frame_with_detections(
-        frame_id=frame_id,
+        frame_id = str(uuid.uuid4()),
+        video_id=video_id,
         camera_id=CAMERA_ID,
         timestamp=timestamp,
         width=width,
@@ -391,7 +382,10 @@ def process_detections_for_db(frame_num, normal_detections, pose_detections):
         track_to_person_id=g_track_to_person_id,
     )
 
-
+def generate_clip_name(base="output/out"):
+    timestamp = datetime.now(MEXICO_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    return f"{base}_{timestamp}.mp4"
+    
 def osd_buffer_probe(pad, info, user_data):
     """Process each frame: extract detections, match poses, write CSV/DB, draw overlays."""
 
@@ -449,6 +443,8 @@ def osd_buffer_probe(pad, info, user_data):
                 l_obj = l_obj.next
             except StopIteration:
                 break
+        
+        has_event = bool(normal_detections)
 
         # Process detections and write to CSV (if enabled)
         if g_config["enable_csv"] and g_csv_writer:
@@ -469,24 +465,66 @@ def osd_buffer_probe(pad, info, user_data):
 
                 g_csv_writer.writerow(row)
         
-        # Send detections to database via Event Hub (non-blocking queue)
-        try:
-            db_queue.put_nowait((
-                frame_meta.frame_num,
-                normal_detections,
-                pose_detections
-            ))
-        except:
-            pass  # Queue full, drop silently to avoid blocking pipeline
+        # === EVENT = DB + VIDEO CLIP (1:1) ===
+        global g_splitmuxsink, recording, frames_without_detections, video_id, video_path, recording_frames
 
+        if frame_meta.frame_num % INFER_STRIDE == 0:
+            if has_event:
+                timestamp = get_mexico_timestamp()
+                print("has event")
+                frames_without_detections = 0
+                recording_frames += 1
+                if not recording :
+                    print("new clip")
+                    video_id = str(uuid.uuid4())
+                    video_path = f"output/temp_{timestamp}.mp4"
+                    g_splitmuxsink.set_property("location", video_path)
+                    g_splitmuxsink.emit("split-now")
+                    recording = True
+                    recording_frames = 0
+                try:
+                    db_queue.put_nowait((
+                        frame_meta.frame_num,
+                        video_id,
+                        normal_detections,
+                        pose_detections,
+                        timestamp
+                    ))
+                except:
+                    pass
+
+                # Split video if recording for more than 5 minutes
+                if recording and recording_frames >  MAX_RECORDING_FRAMES:
+                    print("splitting long clip")
+                    # Rename temp file to final
+                    final_path = video_path.replace("temp_", "")
+                    os.rename(video_path, final_path)
+                    # New clip
+                    video_id = str(uuid.uuid4())
+                    video_path = f"output/temp_{timestamp}.mp4"
+                    g_splitmuxsink.set_property("location", video_path)
+                    g_splitmuxsink.emit("split-now")
+                    recording_frames = 0
+            else: 
+                frames_without_detections += 1
+                if frames_without_detections >= MAX_NO_DET_FRAMES and recording:
+                    print("end clip")
+                    g_splitmuxsink.set_property("location", "null/dummy.mp4")
+                    g_splitmuxsink.emit("split-now")
+                    recording = False
+                    # Rename temp file to final
+                    final_path = video_path.replace("temp_", "")
+                    os.rename(video_path, final_path)
+                    video_path = None
+                    video_id = None
         
         # Set bbox style for visualization
-        for det in normal_detections:
-            set_bbox_style(det["obj_meta"])
+        # for det in normal_detections:
+        #     set_bbox_style(det["obj_meta"])
 
         # Draw pose skeletons
-        for pose in pose_detections:
-            draw_pose(batch_meta, frame_meta, pose["obj_meta"])
+        # for pose in pose_detections:
+        #     draw_pose(batch_meta, frame_meta, pose["obj_meta"])
 
         # Update FPS counter
         if frame_meta.source_id in g_fps_trackers:
@@ -629,11 +667,10 @@ def build_pipeline(source_uri, infer_config, output_path):
     converter2 = create_element("nvvideoconvert", "converter2")
     encoder = create_element("nvv4l2h264enc", "encoder")
     parser = create_element("h264parse", "parser")
-    muxer = create_element("qtmux", "muxer")
-    sink = create_element("filesink", "sink")
+    sink = create_element("splitmuxsink", "sink")
 
     elements = [streammux, source, pgie, tracker, sgie, converter1,
-                capsfilter, osd, converter2, encoder, parser, muxer, sink]
+                capsfilter, osd, converter2, encoder, parser, sink]
 
     if not all(elements):
         return None, "Failed to create pipeline elements"
@@ -665,15 +702,19 @@ def build_pipeline(source_uri, infer_config, output_path):
     # Configure OSD
     osd.set_property("process-mode", int(pyds.MODE_GPU))
     osd.set_property("qos", 0)
+    osd.set_property("display-bbox", 0)
+    osd.set_property("display-text", 0)
 
     # Configure encoder input caps
     caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
     capsfilter.set_property("caps", caps)
 
-    # Configure output
-    sink.set_property("location", output_path)
-    sink.set_property("sync", 0)
-    sink.set_property("async", 0)
+    sink.set_property("location", "null/dummy.mp4")  # Initial dummy location
+    sink.set_property("muxer-factory", "qtmux")
+    sink.set_property("send-keyframe-requests", True)
+    sink.set_property("async-finalize", True)
+    sink.set_property("max-size-time", 0)   # tú controlas los cortes
+
 
     # GPU-specific settings for dGPU
     if not g_config["is_jetson"]:
@@ -703,7 +744,7 @@ def build_pipeline(source_uri, infer_config, output_path):
     links = [
         (streammux, pgie), (pgie, tracker), (tracker, sgie), (sgie, converter1),
         (converter1, capsfilter), (capsfilter, osd), (osd, converter2),
-        (converter2, encoder), (encoder, parser), (parser, muxer), (muxer, sink)
+        (converter2, encoder), (encoder, parser), (parser, sink)
     ]
 
     for src, dst in links:
@@ -716,6 +757,8 @@ def build_pipeline(source_uri, infer_config, output_path):
         return None, "Failed to get OSD sink pad"
     osd_pad.add_probe(Gst.PadProbeType.BUFFER, osd_buffer_probe, None)
 
+    global g_splitmuxsink
+    g_splitmuxsink = sink
     return pipeline, None
 
 
@@ -796,8 +839,8 @@ def db_worker():
     while True:
         try:
             item = db_queue.get(timeout=1.0)
-            frame_num, normal, pose = item
-            process_detections_for_db(frame_num, normal, pose)
+            frame_num, video_id, normal, pose, timestamp = item
+            process_detections_for_db(frame_num, video_id, normal, pose, timestamp)
         except Empty:
             continue
         except Exception as e:
@@ -808,6 +851,9 @@ def db_worker():
             except ValueError:
                 pass
 
+def Azure_worker():
+    uploader = Uploader(camera_id=CAMERA_ID)
+    uploader.loadProcess() 
 
 def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_csv, enable_db):
     """Main entry point."""
@@ -842,6 +888,14 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     db_thread = Thread(target=db_worker, daemon=True, name="DBWorker")
     db_thread.start()
 
+    # Start uploader worker thread
+    uploader_thread = Thread(
+        target=Azure_worker,
+        daemon=True,
+        name="UploaderWorker"
+    )
+    uploader_thread.start()
+
     # Print configuration
     print(f"\n{'='*50}")
     print(f"SOURCE:    {source_uri}")
@@ -858,12 +912,15 @@ def main(source_uri, infer_config, output_path, width, height, gpu_id, enable_cs
     # Start pipeline
     pipeline.set_state(Gst.State.PLAYING)
 
-    # Auto-stop for RTSP sources
-    if source_uri.startswith("rtsp://"):
-        GLib.timeout_add_seconds(RTSP_TIMEOUT_SEC, stop_pipeline, pipeline, loop)
-
     try:
-        loop.run()
+        while True:
+            print("Starting pipeline...")
+            pipeline.set_state(Gst.State.PLAYING)
+            loop.run()
+
+            print("Pipeline stopped, restarting in 3s...")
+            pipeline.set_state(Gst.State.NULL)
+            time.sleep(3)
     except KeyboardInterrupt:
         print("\nInterrupted")
 
