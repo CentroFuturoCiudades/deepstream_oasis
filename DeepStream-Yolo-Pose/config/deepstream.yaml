@@ -1,0 +1,34 @@
+arguments:
+  source:
+    # - file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4
+    - rtsp://100.80.43.126:8554/cam3
+    - rtsp://100.80.43.126:8554/cam7
+    - rtsp://100.80.43.126:8554/cam2
+  camera_ids:
+    - "-3"
+    - "-7"
+    - "-2"
+  config: config/config_infer_primary_yolo11.txt
+  pose_config: config/config_infer_primary_yolo11_pose.txt
+  output: out_yolo11_pose.mp4
+  width: 1920
+  height: 1080
+  gpu: 0
+  enable_csv: true
+  enable_db: true
+
+constants:
+  tracker_config: config_tracker_NvByteTrack.yml
+  tracker_lib: /opt/nvidia/deepstream/deepstream-8.0/lib/libnvds_nvmultiobjecttracker.so
+  streammux_batch_size: 1
+  max_display_elements: 16
+  num_keypoints: 17
+  fps_interval_sec: 5
+  rtsp_timeout_sec: 30
+  infer_stride: 3
+  max_recording_minutes: 3
+  max_no_det_frames: 10
+  eh_max_retries: 3
+  eh_retry_delay: 0.5
+  mexico_tz_offset: -6
+  csv_path: metadata.csv
