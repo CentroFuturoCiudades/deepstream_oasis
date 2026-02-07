@@ -14,21 +14,17 @@ arguments:
   width: 1920
   height: 1080
   gpu: 0
-  enable_csv: true
+  enable_csv: false
   enable_db: true
 
 constants:
   tracker_config: config_tracker_NvByteTrack.yml
   tracker_lib: /opt/nvidia/deepstream/deepstream-8.0/lib/libnvds_nvmultiobjecttracker.so
   streammux_batch_size: 1
-  max_display_elements: 16
   num_keypoints: 17
-  fps_interval_sec: 5
-  rtsp_timeout_sec: 30
-  infer_stride: 3
-  max_recording_minutes: 3
-  max_no_det_frames: 10
-  eh_max_retries: 3
-  eh_retry_delay: 0.5
+  fps_interval_sec: 10      # Interval in seconds to calculate deepstream FPS
+  infer_stride: 3           # Process every 3rd frame for 30 FPS source -> 10 FPS inference
+  max_recording_minutes: 5
+  max_no_det_frames: 100    # Stop recording after 100 frames with no detections
   mexico_tz_offset: -6
   csv_path: metadata.csv

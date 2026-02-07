@@ -1,188 +1,81 @@
-# DeepStream-Yolo-Pose
+# DeepStream YOLO Pose Pipeline
 
-NVIDIA DeepStream SDK 8.0 / 7.1 / 7.0 / 6.4 / 6.3 / 6.2 / 6.1.1 / 6.1 / 6.0.1 / 6.0 application for YOLO-Pose models
+This fork packages the DeepStream YOLO pose pipeline into a maintainable Python application focused on multi-camera ingestion, pose-aware analytics, and downstream publishing. The document walks through the runtime flow and explains the role of every project file so you can extend the system with confidence.
 
---------------------------------------------------------------------------------------------------
-### YOLO object detection models and other infos: https://github.com/marcoslucianops/DeepStream-Yolo
---------------------------------------------------------------------------------------------------
-### Important: Please export the ONNX model with the new export file, generate the TensorRT engine again with the updated files, and use the new config_infer_primary file according to your model
---------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------
+## End-to-End Flow
 
-### Getting started
+1. **Entry point spins up the environment**  
+   [main.py](main.py) imports configuration, initializes GStreamer, and builds the shared output/worker infrastructure.
+2. **Configuration and runtime state are resolved**  
+   [src/config.py](src/config.py) reads `config/deepstream.yaml`, validates required fields, and creates a `RuntimeConfig` that tracks toggles such as CSV and database output.
+3. **Outputs and background workers start**  
+   [src/outputs.py](src/outputs.py) prepares the CSV writer and the Event Hub helper. [src/workers.py](src/workers.py) launches the queue-driven database worker plus per-camera uploader threads.
+4. **Pipelines are created per camera**  
+   For every `(source, camera_id)` pair the entry point instantiates [src/pipeline.py](src/pipeline.py) which wires the GStreamer graph, attaches DeepStream probes, and hands the DB queue to enqueue events.
+5. **Frame processing and analytics**  
+   Buffer probes parse detections, call [src/vision.py](src/vision.py) to extract keypoints, update FPS and recording windows via [src/analytics.py](src/analytics.py), and stream detections to CSV and the DB queue.
+6. **Workers publish to external systems**  
+   The DB worker drains queued frames through [src/send_helper.py](src/send_helper.py) to Azure Event Hub. Uploader threads from [src/uploader.py](src/uploader.py) sync recorded clips per camera when enabled.
+7. **Graceful shutdown**  
+   When the GLib loop exits the entry point tears down pipelines, flushes queues, closes writers, and prints a summary of enabled outputs.
 
-* [Supported models](#supported-models)
-* [Instructions](#basic-usage)
-* [YOLOv7-Pose usage](docs/YOLOv7_Pose.md)
-* [YOLOv8-Pose usage](docs/YOLOv8_Pose.md)
-* [YOLO11-Pose usage](docs/YOLO11_Pose.md)
-* [YOLO-NAS-Pose usage](docs/YOLONAS_Pose.md)
-* [NMS configuration](#nms-configuration)
-* [Detection threshold configuration](#detection-threshold-configuration)
+-----------------------------------------------------------------------------------------------------------------
+## Runtime Sequence
 
-##
+- **Initialization**
+  - Load YAML config and compute runtime booleans (CSV/DB flags, dimensions, GPU id).
+  - Instantiate `OutputManager`, start CSV/Event Hub integrations, and spin up the DB queue + worker.
+  - Launch uploader threads for auxiliary clip syncing.
+  - Create one `CameraPipeline` per camera, each with its own GStreamer bin, inference elements, and analytics helpers.
+- **Main loop**
+  - Start all pipelines and the GLib `MainLoop` to process GStreamer bus events.
+  - Each buffer probe extracts metadata, keypoints, timestamps, and detection scores; detections are logged to CSV and enqueued for the DB worker.
+  - Recording manager opens/closes clips based on detections, while FPS tracker prints rolling stats to the log.
+- **Shutdown**
+  - On termination, stop pipelines, join uploader threads, wait for the DB queue to drain, flush pending Event Hub batches, close the CSV file, and print an execution summary.
 
-### Supported models
+-----------------------------------------------------------------------------------------------------------------
+## File Reference
 
-* [YOLO-NAS-Pose](https://github.com/Deci-AI/super-gradients/blob/master/YOLONAS-POSE.md)
-* [YOLO11-Pose](https://github.com/ultralytics/ultralytics)
-* [YOLOv8-Pose](https://github.com/ultralytics/ultralytics)
-* [YOLOv7-Pose](https://github.com/WongKinYiu/yolov7)
+- [main.py](main.py) – Primary entry point; orchestrates configuration loading, worker startup, pipeline initialization, GLib loop execution, and final teardown.
+- [deepstream_rtsp.py](deepstream_rtsp.py) – Compatibility wrapper that forwards to `main.py` so legacy scripts keep working.
+- [src/config.py](src/config.py) – Parses `config/deepstream.yaml`, validates required fields, exposes data classes for arguments/constants, and provides helpers like `current_timestamp`.
+- [src/pipeline.py](src/pipeline.py) – Defines `CameraPipeline`, constructs the GStreamer graph, installs DeepStream probes, formats detections, manages recording, and pushes events into the DB queue.
+- [src/analytics.py](src/analytics.py) – Houses `FPSTracker` for per-stream performance and `RecordingManager` for clip lifecycle based on detection activity.
+- [src/vision.py](src/vision.py) – Pose utilities: skeleton definition, keypoint extraction from DeepStream metadata, bounding-box helpers, and pose-detection matching logic.
+- [src/outputs.py](src/outputs.py) – `OutputManager` handles CSV headers/rows, Event Hub setup, detection formatting, and cleanup plus convenience summary lines.
+- [src/workers.py](src/workers.py) – Creates the bounded DB queue, runs the background consumer that hands events to `OutputManager`, and spawns uploader threads per camera.
+- [src/send_helper.py](src/send_helper.py) – Thin wrapper around the Azure Event Hub SDK; batches detection payloads, tracks stats, and exposes `flush`/`close` operations.
+- [src/uploader.py](src/uploader.py) – Interacts with storage services to synchronize recorded clips generated by `RecordingManager`.
+- [config/deepstream.yaml](config/deepstream.yaml) – Central configuration file containing sources, camera identifiers, inference configs, output destinations, and runtime tuning constants.
+- [docs/](docs) – Additional assets inherited from the upstream project; consult for model-specific setup instructions.
 
-##
+-----------------------------------------------------------------------------------------------------------------
+## Running the Application
 
-### Instructions
+1. Install NVIDIA DeepStream, the Python bindings (`pyds`), and compile the YOLO pose custom library as described in the original project documentation.  
+   Reference: https://github.com/marcoslucianops/DeepStream-Yolo
+2. Adjust `config/deepstream.yaml` with your camera URIs, camera IDs, output directories, and inference configs.
+3. Launch the pipeline:
 
-#### 1. Download the DeepStream-Yolo-Pose repo
+   ```bash
+   python3 main.py
+   ```
 
-```
-git clone https://github.com/marcoslucianops/DeepStream-Yolo-Pose.git
-cd DeepStream-Yolo-Pose
-```
+   Use `deepstream_rtsp.py` when you need CLI flag compatibility with the legacy script.
 
-#### 2. Compile the libs
+-----------------------------------------------------------------------------------------------------------------
+## Extending the Pipeline
 
-2.1. Set the `CUDA_VER` according to your DeepStream version
+- To adjust inference behavior, edit the `arguments` and `constants` sections in `config/deepstream.yaml`; the settings surface automatically in `RuntimeConfig`.
+- To add new analytics, extend `CameraPipeline._osd_buffer_probe` in [src/pipeline.py](src/pipeline.py) and place reusable utilities in [src/analytics.py](src/analytics.py) or [src/vision.py](src/vision.py).
+- To publish to other sinks, implement additional methods in [src/outputs.py](src/outputs.py) or start new worker threads in [src/workers.py](src/workers.py).
 
-```
-export CUDA_VER=XY.Z
-```
+-----------------------------------------------------------------------------------------------------------------
+## Additional Resources
 
-* x86 platform
+- Original DeepStream-YOLO repository: https://github.com/marcoslucianops/DeepStream-Yolo
+- NVIDIA DeepStream Python Apps: https://github.com/NVIDIA-AI-IOT/deepstream_python_apps
 
-  ```
-  DeepStream 8.0 = 12.8
-  DeepStream 7.1 = 12.6
-  DeepStream 7.0 / 6.4 = 12.2
-  DeepStream 6.3 = 12.1
-  DeepStream 6.2 = 11.8
-  DeepStream 6.1.1 = 11.7
-  DeepStream 6.1 = 11.6
-  DeepStream 6.0.1 / 6.0 = 11.4
-  ```
-
-* Jetson platform
-
-  ```
-  DeepStream 8.0 = 13.0
-  DeepStream 7.1 = 12.6
-  DeepStream 7.0 / 6.4 = 12.2
-  DeepStream 6.3 / 6.2 / 6.1.1 / 6.1 = 11.4
-  DeepStream 6.0.1 / 6.0 = 10.2
-  ```
-
-2.2. Make the libs
-
-```
-make -C nvdsinfer_custom_impl_Yolo_pose clean && make -C nvdsinfer_custom_impl_Yolo_pose
-make clean && make
-```
-
-**NOTE**: To use the Python code, you need to install the DeepStream Python bindings.
-
-Reference: https://github.com/NVIDIA-AI-IOT/deepstream_python_apps
-
-
-* x86 platform: 
-
-  ```
-  pip3 install https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.2/pyds-1.2.2-cp312-cp312-linux_x86_64.whl
-  ```
-
-* Jetson platform:
-
-  ```
-  pip3 install https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.2/pyds-1.2.2-cp312-cp312-linux_aarch64.whl
-  ```
-
-**NOTE**: It is recommended to use Python virtualenv.
-
-**NOTE**: The steps above only work on **DeepStream 8.0**. For previous versions, please check the files on the `NVIDIA-AI-IOT/deepstream_python_apps` repo.
-
-#### 3. Run
-
-* C code
-
-  ```
-  ./deepstream -s file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4 -c config_infer_primary_yoloV8_pose.txt
-  ```
-
-* Python code
-
-  ```
-  python3 deepstream.py -s file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4 -c config_infer_primary_yoloV8_pose.txt
-  ```
-
-**NOTE**: The TensorRT engine file may take a very long time to generate (sometimes more than 10 minutes).
-
-**NOTE**: To change the source
-
-```
--s file:// or rtsp:// or http://
---source file:// or rtsp:// or http://
-```
-
-**NOTE**: To change the infer config file (example for config_infer.txt file)
-
-```
--c config_infer.txt
---infer-config config_infer.txt
-```
-
-**NOTE**: To change the nvstreammux batch-size (example for 2; default: 1)
-
-```
--b 2
---streammux-batch-size 2
-```
-
-**NOTE**: To change the nvstreammux width (example for 1280; default: 1920)
-
-```
--w 1280
---streammux-width 1280
-```
-
-**NOTE**: To change the nvstreammux height (example for 720; default: 1080)
-
-```
--e 720
---streammux-height 720
-```
-
-**NOTE**: To change the GPU id (example for 1; default: 0)
-
-```
--g 1
---gpu-id 1
-```
-
-**NOTE**: The **DeepStream-Yolo-Pose** requires
-
-```
-[property]
-...
-maintain-aspect-ratio=1
-symmetric-padding=1
-...
-```
-
-##
-
-### NMS configuration
-
-For now, the `nms-iou-threshold` is fixed to `0.45`.
-
-**NOTE**: Make sure to set `cluster-mode=4` in the config_infer file.
-
-##
-
-### Detection threshold configuration
-
-```
-[class-attrs-all]
-pre-cluster-threshold=0.25
-```
-
-##
-
-My projects: https://www.youtube.com/MarcosLucianoTV
+These references cover model export, TensorRT engine generation, and platform-specific build steps that continue to apply to this fork.

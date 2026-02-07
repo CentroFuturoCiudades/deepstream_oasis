@@ -1,12 +1,4 @@
-"""
-send_helper.py - Helper class to send inference data to Event Hub
-
-This module provides a SendHelper class with methods to send messages
-to different tables (video_event, person_observed, detection) via Azure Event Hub.
-The messages are consumed by writer.py which inserts them into PostgreSQL.
-
-OPTIMIZED VERSION: Uses async batching with background thread for high throughput.
-"""
+""" send_helper.py - Helper class to send inference data to Event Hub """
 
 import os
 import json
@@ -26,9 +18,6 @@ class SendHelper:
     """
     Helper class to send inference data to Azure Event Hub with batching.
     
-    Messages are buffered and sent in batches to improve throughput.
-    Uses a background thread to send events asynchronously.
-    
     Supported tables:
         - video_event: Video event metadata
         - person_observed: Tracked person information
@@ -42,15 +31,7 @@ class SendHelper:
         flush_interval: float = 0.5,
         max_queue_size: int = 50000,
     ):
-        """
-        Initialize the SendHelper with Event Hub connection.
-        
-        Args:
-            env_file: Path to .env file. If None, uses default .env
-            batch_size: Number of events to batch before sending
-            flush_interval: Max seconds to wait before flushing partial batch
-            max_queue_size: Maximum queue size before blocking
-        """
+        """ Initialize the SendHelper with Event Hub connection. """
         if env_file:
             load_dotenv(env_file)
         else:
@@ -206,12 +187,8 @@ class SendHelper:
                 self._errors += 1
     
     def close(self):
-        """
-        Close the Event Hub producer connection and stop sender thread.
-        
-        Waits indefinitely for all pending events to be sent.
-        Only call this on Ctrl+C / SIGTERM / docker stop.
-        """
+        """ Close the Event Hub producer connection and stop sender thread. """
+
         pending = self._queue.qsize()
         if pending > 0:
             print(f"Closing SendHelper: waiting for {pending} pending events...")
@@ -353,39 +330,13 @@ class SendHelper:
         track_to_person_id: Dict[int, str],
     ) -> int:
         """
-        Send a all frame detections from a video in one call.
-        
-        This is the most efficient method for sending detection data.
-        All events are queued together and will be batched by the sender thread.
-        
-        Uses video_id as partition_key to allow parallel processing across videos,
-        while maintaining order within each video (video -> person -> detection).
-        
-        IMPORTANT: person_observed is sent with EVERY detection (idempotent).
-        This ensures person_observed always arrives with/before its detection,
-        regardless of partition ordering. The writer uses ON CONFLICT DO NOTHING.
-        
-        Args:
-            video_id: Unique video identifier (also used as partition_key)
-            camera_id: Camera identifier
-            timestamp: ISO format timestamp
-            width: Video width
-            height: Video height
-            detections: List of detection dicts with keys:
-                - track_id: int
-                - confidence: float
-                - bbox: dict with x, y, width, height
-                - skeleton: optional list of keypoints
-            track_to_person_id: Mutable dict mapping track_id -> person_id
-                (will be updated with new tracks)
-        
-        Returns:
-            Number of events queued
+        Send a all frame detections from a video in one call. 
+        Uses frame_id as partition_key to allow parallel processing across frames,
+        while maintaining order within each frame (video -> person -> detection).
         """
         events_queued = 0
         
-        # Use video_id as partition_key for parallelism across videos
-        # All events for this video go to the same partition (maintains order)
+        # Use frame_id as partition_key for parallelism across frames
         partition_key = frame_id
         
         # Queue video first
@@ -403,6 +354,9 @@ class SendHelper:
         # Process each detection
         for det in detections:
             track_id = det["track_id"]
+            # No track_id means no person to track
+            if track_id is None:
+                continue
             
             # Get or create person_id (track_to_person_id used for consistency)
             if track_id not in track_to_person_id:

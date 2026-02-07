@@ -1,0 +1,4 @@
+
+[submodule "DeepStream-Yolo-Pose/src/age_group_classifier"]
+	path = DeepStream-Yolo-Pose/src/age_group_classifier
+	url = https://github.com/CentroFuturoCiudades/age-group-classifier.git

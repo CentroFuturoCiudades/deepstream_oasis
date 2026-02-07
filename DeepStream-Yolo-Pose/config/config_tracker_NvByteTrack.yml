@@ -3,7 +3,7 @@ BaseConfig:
 
 TargetManagement:
   maxTargetsPerStream: 150
-  probationAge: 20
+  probationAge: 30
   maxShadowTrackingAge: 60
   earlyTerminationAge: 15
 

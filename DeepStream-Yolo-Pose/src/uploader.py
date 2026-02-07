@@ -69,12 +69,10 @@ class Uploader():
 
         while(True):
             files = glob(f'output/{self.camera_id}/*.mp4',recursive=True)
-            print(f'Loaded files: {files}')
             for f in files:
                 filename = os.path.basename(f)
 
                 if filename.startswith("temp"):
-                    print(f'Skipping temp file {f}')
                     continue
                 
                 # Evit files that are being written
