@@ -1,9 +1,9 @@
 BaseConfig:
-  minDetectorConfidence: 0.25
+  minDetectorConfidence: 0.4
 
 TargetManagement:
   maxTargetsPerStream: 150
-  probationAge: 30
+  probationAge: 20 # this use the video FPS(30), no the inference FPS
   maxShadowTrackingAge: 60
   earlyTerminationAge: 15
 

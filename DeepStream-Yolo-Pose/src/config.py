@@ -6,9 +6,13 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Sequence
+
 import yaml
+from dotenv import load_dotenv
 
 DEFAULT_CONFIG_FILE = "config/deepstream.yaml"
+
+load_dotenv()
 
 class ConfigError(Exception):
     """Raised when configuration values are invalid or missing."""
@@ -78,7 +82,7 @@ class ConstantsConfig:
 
     @property
     def max_recording_frames(self) -> int:
-        return 30 * 60 * self.max_recording_minutes # Assuming 30 FPS
+        return int((30 / self.infer_stride) * 60 * self.max_recording_minutes) # Assuming 30 FPS
 
     @property
     def mexico_timezone(self) -> timezone:
@@ -116,9 +120,17 @@ def load_app_config(path: str = DEFAULT_CONFIG_FILE) -> AppConfig:
     arguments = raw_config.get("arguments", {})
     constants = raw_config.get("constants", {})
 
-    sources = _as_list(
-        _require("arguments", "source", raw_config, path), "arguments.source"
-    )
+    env_sources = os.getenv("CAMERA_SOURCES")
+    if env_sources:
+        sources = _as_list(env_sources, "CAMERA_SOURCES")
+    else:
+        try:
+            sources_value = _require("arguments", "source", raw_config, path)
+        except ConfigError as exc:
+            raise ConfigError(
+                "arguments.source missing in config and CAMERA_SOURCES not set"
+            ) from exc
+        sources = _as_list(sources_value, "arguments.source")
     camera_ids = _as_list(
         _require("arguments", "camera_ids", raw_config, path), "arguments.camera_ids"
     )

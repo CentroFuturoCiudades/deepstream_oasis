@@ -4,9 +4,11 @@ from __future__ import annotations
 import sys
 import time
 import gi
+
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
-from src import config, outputs, pipeline, workers
+from src import classifier_worker, config, outputs, pipeline, workers
+
 
 def main() -> int:
     """Launch the DeepStream pipelines and manage their lifecycle."""
@@ -19,6 +21,15 @@ def main() -> int:
     output_manager = outputs.OutputManager(app_config, runtime)
     output_manager.init_csv()
     output_manager.init_event_hub()
+
+    classification_worker_instance: (
+        classifier_worker.TrackletClassificationWorker | None
+    )
+    classification_worker_instance = None
+    classification_worker_instance = classifier_worker.TrackletClassificationWorker(
+        camera_ids=app_config.arguments.camera_ids
+    )
+    classification_worker_instance.start()
 
     db_queue = workers.create_db_queue()
     workers.start_db_worker(db_queue, output_manager)
@@ -81,6 +92,9 @@ def main() -> int:
     finally:
         for pipe in pipelines:
             pipe.stop()
+
+    if classification_worker_instance:
+        classification_worker_instance.stop()
 
     output_manager.close_csv()
 

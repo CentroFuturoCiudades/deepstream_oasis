@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import uuid
 from typing import Any, List, Sequence
 
 import gi
@@ -16,6 +17,7 @@ import pyds
 
 from .analytics import FPSTracker, RecordingConfig, RecordingManager
 from .config import AppConfig, RuntimeConfig, current_timestamp
+from .metadata import ClipMetadataWriter
 from .outputs import OutputManager
 from .vision import SKELETON, clamp, extract_keypoints
 
@@ -64,8 +66,9 @@ class CameraPipeline:
         self.error: str | None = None
 
         self.recording: RecordingManager | None = None
-        self.track_to_person_id: dict[int, int] = {}
+        self.track_to_person_id: dict[int, str] = {}
         self.fps_tracker = FPSTracker(index)
+        self.metadata_writer = ClipMetadataWriter(camera_id=self.camera_id)
 
         self._initialize_pipeline()
 
@@ -206,6 +209,7 @@ class CameraPipeline:
                 max_recording_frames=constants.max_recording_frames,
                 max_no_detection_frames=constants.max_no_det_frames,
             ),
+            metadata_writer=self.metadata_writer,
         )
 
         self.bus = pipeline.get_bus()
@@ -240,8 +244,6 @@ class CameraPipeline:
         source.connect("pad-added", self._on_pad_added, sink_pad)
         source.connect("child-added", self._on_child_added, None)
 
-        interval_ms = self.app_config.constants.fps_interval_sec * 1000
-        GLib.timeout_add(interval_ms, self.fps_tracker.print_callback)
         return source
 
     def _on_child_added(self, child_proxy, obj, name, user_data) -> None:
@@ -331,10 +333,17 @@ class CameraPipeline:
                         {"keypoints": keypoints, "obj_meta": obj_meta}
                     )
                 else:
+                    track_id = obj_meta.object_id
+                    person_id = None
+                    if track_id is not None:
+                        person_id = self.track_to_person_id.setdefault(
+                            track_id, str(uuid.uuid4())
+                        )
+
                     normal_detections.append(
                         {
                             "frame": frame_meta.frame_num,
-                            "track_id": obj_meta.object_id,
+                            "track_id": track_id,
                             "bbox": (
                                 bbox.left,
                                 bbox.top,
@@ -342,6 +351,7 @@ class CameraPipeline:
                                 bbox.height,
                             ),
                             "confidence": obj_meta.confidence,
+                            "person_id": person_id,
                             "obj_meta": obj_meta,
                         }
                     )
@@ -386,7 +396,9 @@ class CameraPipeline:
                     timestamp,
                 )
                 if self.recording:
-                    self.recording.finalize_detection_window(timestamp) # Slip long clips
+                    self.recording.finalize_detection_window(
+                        timestamp
+                    )  # Slip long clips
             else:
                 if self.recording:
                     self.recording.on_no_detections()
@@ -418,6 +430,16 @@ class CameraPipeline:
             self.track_to_person_id,
         )
 
+        if self.recording and self.recording.video_id:
+            for det in normal_detections:
+                self.metadata_writer.record_detection(
+                    video_id=self.recording.video_id,
+                    track_id=det.get("track_id"),
+                    person_id=det.get("person_id"),
+                    timestamp=timestamp,
+                    bbox=det.get("bbox", (0, 0, 0, 0)),
+                )
+
         try:
             self.db_queue.put_nowait(payload)
         except Exception:  # pylint: disable=broad-except
@@ -433,6 +455,8 @@ class CameraPipeline:
     def stop(self) -> None:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+        if self.recording:
+            self.recording.finalize_clip()
 
 
 def draw_pose(

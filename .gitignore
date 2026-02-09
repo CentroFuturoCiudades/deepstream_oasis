@@ -4,6 +4,7 @@
 **/*.engine
 **/*.onnx
 **/*.mp4
+**/*.jpg
 **/*.plan
 **/*.trt
 **/*.cache

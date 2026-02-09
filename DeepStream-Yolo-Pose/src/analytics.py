@@ -7,9 +7,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from threading import Lock
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from gi.repository import Gst
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .metadata import ClipMetadataWriter
 
 
 class FPSTracker:
@@ -72,16 +75,19 @@ class RecordingManager:
         camera_id: str,
         splitmuxsink: Gst.Element,
         config: RecordingConfig,
+        metadata_writer: "ClipMetadataWriter" | None = None,
     ) -> None:
         """Prepare recording state for a camera stream."""
         self.camera_id = camera_id
         self.splitmuxsink = splitmuxsink
         self.config = config
+        self.metadata_writer = metadata_writer
         self.recording = False
         self.video_id: Optional[str] = None
         self.video_path: Optional[str] = None
         self.frames_without_detections = 0
         self.recording_frames = 0
+        self._clip_basename: Optional[str] = None
 
     def on_detections(self, timestamp: str) -> None:
         """Update recording state when detections are present."""
@@ -106,34 +112,71 @@ class RecordingManager:
         if self.video_path:
             final_path = self.video_path.replace("temp_", "")
             os.rename(self.video_path, final_path)
+            if self.metadata_writer:
+                self.metadata_writer.finalize_clip(self.video_id, final_path)
         self.video_path = None
         self.video_id = None
+        self._clip_basename = None
 
     def _start_new_clip(self, timestamp: str) -> None:
         """Start a fresh recording segment anchored to the timestamp."""
-        #print("new clip")
+        # print("new clip")
         self.video_id = str(uuid.uuid4())
         directory = os.path.join("output", str(self.camera_id))
+        os.makedirs(directory, exist_ok=True)
+        self._clip_basename = timestamp
         self.video_path = os.path.join(directory, f"temp_{timestamp}.mp4")
         self.splitmuxsink.set_property("location", self.video_path)
         self.splitmuxsink.emit("split-now")
         self.recording = True
         self.recording_frames = 0
+        if self.metadata_writer and self.video_id:
+            self.metadata_writer.start_clip(
+                video_id=self.video_id,
+                clip_basename=self._clip_basename,
+                clip_start_ts=timestamp,
+            )
 
     def _split_clip(self, timestamp: str) -> None:
         """Rotate to a new segment once the max clip length is exceeded."""
-        #print("splitting long clip")
-        if self.video_path:
-            final_path = self.video_path.replace("temp_", "")
-            os.rename(self.video_path, final_path)
+        # print("splitting long clip")
+        previous_video_id = self.video_id
+        previous_path = self.video_path
+        if previous_path:
+            final_path = previous_path.replace("temp_", "")
+            os.rename(previous_path, final_path)
+            if self.metadata_writer:
+                self.metadata_writer.finalize_clip(previous_video_id, final_path)
         self.video_id = str(uuid.uuid4())
         directory = os.path.join("output", str(self.camera_id))
         self.video_path = os.path.join(directory, f"temp_{timestamp}.mp4")
+        self._clip_basename = timestamp
         self.splitmuxsink.set_property("location", self.video_path)
         self.splitmuxsink.emit("split-now")
         self.recording_frames = 0
+        if self.metadata_writer and self.video_id:
+            self.metadata_writer.start_clip(
+                video_id=self.video_id,
+                clip_basename=self._clip_basename,
+                clip_start_ts=timestamp,
+            )
 
     def finalize_detection_window(self, timestamp: str) -> None:
         """Check whether the active clip should be split due to length."""
         if self.recording and self.recording_frames > self.config.max_recording_frames:
             self._split_clip(timestamp)
+
+    def finalize_clip(self) -> None:
+        """Force a clip to close and persist metadata if recording is active."""
+        if not self.recording or not self.video_path:
+            return
+        final_path = self.video_path.replace("temp_", "")
+        self.splitmuxsink.set_property("location", "null/dummy.mp4")
+        self.splitmuxsink.emit("split-now")
+        os.rename(self.video_path, final_path)
+        if self.metadata_writer:
+            self.metadata_writer.finalize_clip(self.video_id, final_path)
+        self.recording = False
+        self.video_path = None
+        self.video_id = None
+        self._clip_basename = None

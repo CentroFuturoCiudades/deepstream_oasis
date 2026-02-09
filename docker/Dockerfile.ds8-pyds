@@ -11,25 +11,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pybind11-dev libeigen3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Compat: algunos bindings incluyen <pybind11.h> (legacy).
-# Wrapper (NO symlink) para que los includes relativos "detail/..." funcionen.
+# Compatibility shim for bindings that include <pybind11.h> directly (legacy path).
 RUN rm -f /usr/include/pybind11.h && \
     printf '%s\n' '#pragma once' '#include <pybind11/pybind11.h>' > /usr/include/pybind11.h
 
-# (Opcional) librerías para evitar warnings de plugins de gstreamer (audio/dvd/etc)
+# Optional: avoid missing-plugin warnings from GStreamer (audio/DVD,etc).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libflac12 libmpg123-0 libdca0 libdvdread8 libdvdnav4 libmp3lame0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Crear venv + numpy compatible
+# Create virtualenv with compatible numpy
 RUN python3 -m venv --system-site-packages ${VENV_DIR} && \
     ${VENV_DIR}/bin/python -m pip install --upgrade pip && \
-    ${VENV_DIR}/bin/pip install --force-reinstall "numpy==1.26.0"
+    ${VENV_DIR}/bin/pip install --force-reinstall "numpy==1.26.0" && \
+    ${VENV_DIR}/bin/pip install dotenv && \
+    ${VENV_DIR}/bin/pip install --upgrade pip setuptools wheel && \
+    ${VENV_DIR}/bin/pip install azure-eventhub && \
+    ${VENV_DIR}/bin/pip install azure-storage-blob Pillow
 
 WORKDIR /tmp/deepstream_python_apps
 COPY deepstream_python_apps /tmp/deepstream_python_apps
 
-# (opcional) si quieres python3-pybind11 instalado (no es estrictamente necesario para compilar)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pybind11 \
     && rm -rf /var/lib/apt/lists/*

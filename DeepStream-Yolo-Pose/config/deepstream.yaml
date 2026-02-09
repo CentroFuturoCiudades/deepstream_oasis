@@ -1,13 +1,12 @@
 arguments:
-  source:
-    # - file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4
-    - rtsp://100.80.43.126:8554/cam3
-    - rtsp://100.80.43.126:8554/cam7
-    - rtsp://100.80.43.126:8554/cam2
+  source: [] # Populated via CAMERA_SOURCES env var
   camera_ids:
-    - "-3"
-    - "-7"
-    - "-2"
+    - "1"
+    - "2"
+    - "3"
+    - "5"
+    - "6"
+    - "7"
   config: config/config_infer_primary_yolo11.txt
   pose_config: config/config_infer_primary_yolo11_pose.txt
   output: out_yolo11_pose.mp4

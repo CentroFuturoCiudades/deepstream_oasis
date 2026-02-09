@@ -17,13 +17,13 @@ from azure.eventhub import EventHubProducerClient, EventData
 class SendHelper:
     """
     Helper class to send inference data to Azure Event Hub with batching.
-    
+
     Supported tables:
         - video_event: Video event metadata
         - person_observed: Tracked person information
         - detection: Individual detection with bounding box and skeleton
     """
-    
+
     def __init__(
         self,
         env_file: Optional[str] = None,
@@ -31,56 +31,54 @@ class SendHelper:
         flush_interval: float = 0.5,
         max_queue_size: int = 50000,
     ):
-        """ Initialize the SendHelper with Event Hub connection. """
+        """Initialize the SendHelper with Event Hub connection."""
         if env_file:
             load_dotenv(env_file)
         else:
             load_dotenv()
-        
+
         self.namespace = os.getenv("EH_NAMESPACE")
         self.eventhub = os.getenv("EH_EVENTHUB")
         self.policy = os.getenv("EH_SEND_POLICY")
         self.key = os.getenv("EH_SEND_KEY")
-        
+
         self.project = os.getenv("PROJECT", "lupacity")
         self.site_id = os.getenv("SITE_ID", "site-01")
-        
+
         self._connection_str = (
             f"Endpoint=sb://{self.namespace}.servicebus.windows.net/;"
             f"SharedAccessKeyName={self.policy};"
             f"SharedAccessKey={self.key};"
             f"EntityPath={self.eventhub}"
         )
-        
+
         # Batching configuration
         self._batch_size = batch_size
         self._flush_interval = flush_interval
-        
+
         # Internal queue for async sending
         self._queue: Queue = Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
         self._sender_thread: Optional[threading.Thread] = None
         self._producer: Optional[EventHubProducerClient] = None
-        
+
         # Statistics
         self._events_queued = 0
         self._events_sent = 0
         self._batches_sent = 0
         self._errors = 0
         self._lock = threading.Lock()
-        
+
         # Start background sender thread
         self._start_sender_thread()
-    
+
     def _start_sender_thread(self):
         """Start the background sender thread."""
         self._sender_thread = threading.Thread(
-            target=self._sender_loop,
-            daemon=True,
-            name="EventHubSender"
+            target=self._sender_loop, daemon=True, name="EventHubSender"
         )
         self._sender_thread.start()
-    
+
     def _get_producer(self) -> EventHubProducerClient:
         """Get or create Event Hub producer."""
         if self._producer is None:
@@ -88,12 +86,12 @@ class SendHelper:
                 self._connection_str
             )
         return self._producer
-    
+
     def _sender_loop(self):
         """Background thread that batches and sends events grouped by partition_key."""
         buffer: List[Dict[str, Any]] = []
         last_flush = time.time()
-        
+
         while not self._stop_event.is_set():
             try:
                 # Try to get an event with timeout
@@ -103,31 +101,30 @@ class SendHelper:
                     self._queue.task_done()
                 except Empty:
                     pass
-                
+
                 # Check if we should flush
-                should_flush = (
-                    len(buffer) >= self._batch_size or
-                    (buffer and time.time() - last_flush >= self._flush_interval)
+                should_flush = len(buffer) >= self._batch_size or (
+                    buffer and time.time() - last_flush >= self._flush_interval
                 )
-                
+
                 if should_flush and buffer:
                     self._send_batch_by_partition(buffer)
                     buffer = []
                     last_flush = time.time()
-                    
+
             except Exception as e:
                 print(f"ERROR in sender loop: {e}")
                 with self._lock:
                     self._errors += 1
                 time.sleep(0.1)
-        
+
         # Flush remaining events on shutdown
         if buffer:
             try:
                 self._send_batch_by_partition(buffer)
             except Exception as e:
                 print(f"ERROR flushing final batch: {e}")
-    
+
     def _send_batch_by_partition(self, events: List[Dict[str, Any]]):
         """
         Group events by partition_key and send each group as a separate batch.
@@ -135,30 +132,32 @@ class SendHelper:
         """
         if not events:
             return
-        
+
         # Group events by partition_key (defaultdict imported at top)
         partitions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        
+
         for event in events:
             # Extract partition_key from event, default to "default"
             pk = event.pop("_partition_key", "default")
             partitions[pk].append(event)
-        
+
         # Send each partition's events as a batch (maintains order within partition)
         for partition_key, partition_events in partitions.items():
             self._send_batch_internal(partition_events, partition_key)
-    
-    def _send_batch_internal(self, events: List[Dict[str, Any]], partition_key: Optional[str] = None):
+
+    def _send_batch_internal(
+        self, events: List[Dict[str, Any]], partition_key: Optional[str] = None
+    ):
         """Actually send a batch of events to Event Hub with partition_key for ordering."""
         if not events:
             return
-            
+
         try:
             producer = self._get_producer()
             # Create batch with partition_key to ensure FIFO ordering
             batch = producer.create_batch(partition_key=partition_key)
             events_in_batch = 0
-            
+
             for event in events:
                 try:
                     batch.add(EventData(json.dumps(event)))
@@ -173,37 +172,39 @@ class SendHelper:
                     batch = producer.create_batch(partition_key=partition_key)
                     batch.add(EventData(json.dumps(event)))
                     events_in_batch = 1
-            
+
             # Send remaining events in batch
             if events_in_batch > 0:
                 producer.send_batch(batch)
                 with self._lock:
                     self._events_sent += events_in_batch
                     self._batches_sent += 1
-                    
+
         except Exception as e:
-            print(f"ERROR sending batch ({len(events)} events, pk={partition_key}): {e}")
+            print(
+                f"ERROR sending batch ({len(events)} events, pk={partition_key}): {e}"
+            )
             with self._lock:
                 self._errors += 1
-    
+
     def close(self):
-        """ Close the Event Hub producer connection and stop sender thread. """
+        """Close the Event Hub producer connection and stop sender thread."""
 
         pending = self._queue.qsize()
         if pending > 0:
             print(f"Closing SendHelper: waiting for {pending} pending events...")
-        
+
         # Wait for queue to drain completely (no timeout)
         while not self._queue.empty():
             time.sleep(0.1)
-        
+
         # Signal thread to stop
         self._stop_event.set()
-        
+
         # Wait for sender thread to finish (it will flush any remaining buffer)
         if self._sender_thread and self._sender_thread.is_alive():
             self._sender_thread.join()  # No timeout - wait indefinitely
-        
+
         # Close producer
         if self._producer is not None:
             try:
@@ -211,18 +212,20 @@ class SendHelper:
             except Exception:
                 pass
             self._producer = None
-        
+
         # Print stats
         with self._lock:
-            print(f"SendHelper closed: {self._events_sent} events sent in {self._batches_sent} batches ({self._errors} errors)")
-    
+            print(
+                f"SendHelper closed: {self._events_sent} events sent in {self._batches_sent} batches ({self._errors} errors)"
+            )
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
-    
+
     # -------------------------------------------------------------------------
     # Core queue method
     # -------------------------------------------------------------------------
@@ -231,7 +234,7 @@ class SendHelper:
         # Store partition_key in payload for later extraction
         if partition_key:
             payload["_partition_key"] = partition_key
-        
+
         try:
             self._queue.put_nowait(payload)
             with self._lock:
@@ -241,7 +244,7 @@ class SendHelper:
             self._queue.put(payload)  # Blocks indefinitely
             with self._lock:
                 self._events_queued += 1
-    
+
     # -------------------------------------------------------------------------
     # Table-specific methods (now queue-based for async sending)
     # -------------------------------------------------------------------------
@@ -257,7 +260,7 @@ class SendHelper:
         """Send a video record to Event Hub (queued for async sending)."""
         if timestamp is None:
             timestamp = datetime.utcnow().isoformat() + "Z"
-        
+
         payload = {
             "table": "video_event",
             "id": video_id,
@@ -267,26 +270,29 @@ class SendHelper:
             "width": width,
             "height": height,
         }
-        
+
         self._enqueue(payload)
         return payload
-    
+
     def send_person_observed(
         self,
         person_id: str,
         age_group: Optional[str] = None,
-        camera_id: Optional[str] = None,
+        confidence: Optional[float] = None,
+        model_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send a person_observed record to Event Hub (queued for async sending)."""
         payload = {
             "table": "person_observed",
             "id": person_id,
             "age_group": age_group,
+            "confidence": confidence,
+            "model_version": model_version,
         }
-        
+
         self._enqueue(payload)
         return payload
-    
+
     def send_detection(
         self,
         detection_id: str,
@@ -311,10 +317,10 @@ class SendHelper:
             "px_geometry": px_geometry,
             "real_geometry": real_geometry,
         }
-        
+
         self._enqueue(payload)
         return payload
-    
+
     # -------------------------------------------------------------------------
     # Bulk method for maximum efficiency
     # -------------------------------------------------------------------------
@@ -330,67 +336,76 @@ class SendHelper:
         track_to_person_id: Dict[int, str],
     ) -> int:
         """
-        Send a all frame detections from a video in one call. 
+        Send a all frame detections from a video in one call.
         Uses frame_id as partition_key to allow parallel processing across frames,
         while maintaining order within each frame (video -> person -> detection).
         """
         events_queued = 0
-        
+
         # Use frame_id as partition_key for parallelism across frames
         partition_key = frame_id
-        
+
         # Queue video first
-        self._enqueue({
-            "table": "video_event",
-            "id": video_id,
-            "camera_id": camera_id,
-            "start_ts": timestamp,
-            "video_path": f"{camera_id}/{timestamp}.mp4",
-            "width": width,
-            "height": height,
-        }, partition_key=partition_key)
+        self._enqueue(
+            {
+                "table": "video_event",
+                "id": video_id,
+                "camera_id": camera_id,
+                "start_ts": timestamp,
+                "video_path": f"{camera_id}/{timestamp}.mp4",
+                "width": width,
+                "height": height,
+            },
+            partition_key=partition_key,
+        )
         events_queued += 1
-        
+
         # Process each detection
         for det in detections:
             track_id = det["track_id"]
             # No track_id means no person to track
             if track_id is None:
                 continue
-            
+
             # Get or create person_id (track_to_person_id used for consistency)
             if track_id not in track_to_person_id:
                 person_id = str(uuid.uuid4())
                 track_to_person_id[track_id] = person_id
             else:
                 person_id = track_to_person_id[track_id]
-            
+
             # ALWAYS send person_observed (idempotent - ON CONFLICT DO NOTHING)
             # This guarantees person exists before detection, regardless of partition order
-            self._enqueue({
-                "table": "person_observed",
-                "id": person_id,
-                "age_group": None,
-            }, partition_key=partition_key)
+            self._enqueue(
+                {
+                    "table": "person_observed",
+                    "id": person_id,
+                    "age_group": None,
+                },
+                partition_key=partition_key,
+            )
             events_queued += 1
-            
+
             # Queue detection
-            self._enqueue({
-                "table": "detection",
-                "id": str(uuid.uuid4()),
-                "person_id": person_id,
-                "video_event_id": video_id,
-                "timestamp": timestamp,
-                "confidence": det.get("confidence", 0.0),
-                "bbox": det.get("bbox"),
-                "skeleton": det.get("skeleton"),
-                "px_geometry": None,
-                "real_geometry": None,
-            }, partition_key=partition_key)
+            self._enqueue(
+                {
+                    "table": "detection",
+                    "id": str(uuid.uuid4()),
+                    "person_id": person_id,
+                    "video_event_id": video_id,
+                    "timestamp": timestamp,
+                    "confidence": det.get("confidence", 0.0),
+                    "bbox": det.get("bbox"),
+                    "skeleton": det.get("skeleton"),
+                    "px_geometry": None,
+                    "real_geometry": None,
+                },
+                partition_key=partition_key,
+            )
             events_queued += 1
-        
+
         return events_queued
-    
+
     # -------------------------------------------------------------------------
     # Stats and control
     # -------------------------------------------------------------------------
@@ -404,29 +419,31 @@ class SendHelper:
                 "errors": self._errors,
                 "queue_size": self._queue.qsize(),
             }
-    
+
     def flush(self):
         """
         Wait for all queued events to be sent.
-        
+
         Blocks indefinitely until queue is empty.
         """
         initial_size = self._queue.qsize()
-        
+
         if initial_size > 0:
             print(f"Flushing {initial_size} pending events...")
-        
+
         while not self._queue.empty():
             time.sleep(0.1)
-    
+
     def print_stats(self):
         """Print current statistics."""
         stats = self.get_stats()
-        print(f"[SendHelper] Queued: {stats['events_queued']} | "
-              f"Sent: {stats['events_sent']} | "
-              f"Batches: {stats['batches_sent']} | "
-              f"Queue: {stats['queue_size']} | "
-              f"Errors: {stats['errors']}")
+        print(
+            f"[SendHelper] Queued: {stats['events_queued']} | "
+            f"Sent: {stats['events_sent']} | "
+            f"Batches: {stats['batches_sent']} | "
+            f"Queue: {stats['queue_size']} | "
+            f"Errors: {stats['errors']}"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -449,6 +466,7 @@ def close_default_helper():
     if _default_helper is not None:
         _default_helper.close()
         _default_helper = None
+
 
 # ---------------------------------------------------------------------
 # Example usage / test
@@ -477,7 +495,7 @@ if __name__ == "__main__":
                 video_id=video_id,
                 camera_id=camera_id,
                 timestamp=datetime.utcnow().isoformat() + "Z",
-                video_path=f"{video_id}.mp4",   
+                video_path=f"{video_id}.mp4",
                 width=1920,
                 height=1080,
             )
@@ -494,7 +512,12 @@ if __name__ == "__main__":
                     {
                         "track_id": i,
                         "confidence": 0.9,
-                        "bbox": {"x": 100 + i*50, "y": 100, "width": 50, "height": 120},
+                        "bbox": {
+                            "x": 100 + i * 50,
+                            "y": 100,
+                            "width": 50,
+                            "height": 120,
+                        },
                         "skeleton": None,
                     }
                     for i in range(detections_per_frame)
