@@ -127,9 +127,9 @@ class CameraPipeline:
         )
 
         pgie.set_property("config-file-path", self.app_config.arguments.infer_config)
-        pgie.set_property("qos", 0)
+        pgie.set_property("qos", 1)
         sgie.set_property("config-file-path", self.app_config.arguments.pose_config)
-        sgie.set_property("qos", 0)
+        sgie.set_property("qos", 1)
 
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
@@ -138,7 +138,7 @@ class CameraPipeline:
         tracker.set_property("ll-config-file", constants.tracker_config)
 
         osd.set_property("process-mode", int(pyds.MODE_GPU))
-        osd.set_property("qos", 0)
+        osd.set_property("qos", 1)
         osd.set_property("display-bbox", 0)
         osd.set_property("display-text", 0)
 
@@ -150,6 +150,7 @@ class CameraPipeline:
         sink.set_property("send-keyframe-requests", True)
         sink.set_property("async-finalize", True)
         sink.set_property("max-size-time", 0)
+        try_set_property(sink, "sync", False)
 
         if not self.runtime.is_jetson:
             gpu = self.runtime.gpu_id
@@ -249,10 +250,12 @@ class CameraPipeline:
     def _on_child_added(self, child_proxy, obj, name, user_data) -> None:
         if "decodebin" in name:
             obj.connect("child-added", self._on_child_added, user_data)
+        elif "rtspsrc" in name:
+            try_set_property(obj, "drop-on-latency", True)
         elif "nvv4l2decoder" in name:
             obj.set_property("drop-frame-interval", 0)
             obj.set_property("num-extra-surfaces", 1)
-            obj.set_property("qos", 0)
+            obj.set_property("qos", 1)
             if self.runtime.is_jetson:
                 obj.set_property("enable-max-performance", 1)
             else:
@@ -303,6 +306,9 @@ class CameraPipeline:
                 frame_meta = pyds.NvDsFrameMeta.cast(frame_meta_list.data)
             except StopIteration:
                 break
+
+            if self.recording:
+                self.recording.note_frame_pts(getattr(frame_meta, "buf_pts", None))
 
             if frame_meta.frame_num % self.app_config.constants.infer_stride != 0:
                 try:

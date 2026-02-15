@@ -103,3 +103,15 @@ class ClipMetadataWriter:
         if not video_id:
             return
         self._clips.pop(video_id, None)
+
+    def set_clip_fps(self, video_id: Optional[str], fps: Optional[float]) -> None:
+        """Override the FPS stored for an in-flight clip."""
+        if not video_id or fps is None:
+            return
+        clip = self._clips.get(video_id)
+        if not clip:
+            return
+        try:
+            clip.fps = float(fps)
+        except (TypeError, ValueError):
+            pass

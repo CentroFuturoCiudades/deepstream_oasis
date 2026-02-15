@@ -126,9 +126,12 @@ class TrackletClassificationWorker:
         if not clip_start_str:
             raise ValueError(f"Missing clip_start_ts in {json_path}")
         clip_start_ts = self._parse_timestamp(clip_start_str)
+        clip_fps = self._extract_clip_fps(metadata)
 
         tracks: Dict[str, List[dict]] = metadata.get("tracks", {})
-        frame_plan, track_person = self._prepare_frame_plan(tracks, clip_start_ts)
+        frame_plan, track_person = self._prepare_frame_plan(
+            tracks, clip_start_ts, clip_fps
+        )
         if not frame_plan:
             print(f"[Classifier] No usable detections in '{video_path.name}', marking ready")
             self._finalize_clip(video_path, json_path)
@@ -218,6 +221,7 @@ class TrackletClassificationWorker:
         self,
         tracks: Dict[str, List[dict]],
         clip_start_ts: datetime,
+        clip_fps: float,
     ) -> Tuple[List[Tuple[int, List[Dict[str, Any]]]], Dict[str, Optional[str]]]:
         frame_map: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         track_person: Dict[str, Optional[str]] = {}
@@ -232,7 +236,9 @@ class TrackletClassificationWorker:
                 bbox = det.get("bbox")
                 if not timestamp_str or not bbox:
                     continue
-                frame_index = self._timestamp_to_frame(timestamp_str, clip_start_ts)
+                frame_index = self._timestamp_to_frame(
+                    timestamp_str, clip_start_ts, clip_fps
+                )
                 if frame_index < 0:
                     continue
                 frame_map[frame_index].append(
@@ -313,11 +319,23 @@ class TrackletClassificationWorker:
         filename = track_dir / f"crop_{index:04d}.jpg"
         cv2.imwrite(str(filename), crop)
 
-    def _timestamp_to_frame(self, timestamp_str: str, clip_start: datetime) -> int:
+    def _timestamp_to_frame(
+        self, timestamp_str: str, clip_start: datetime, fps: float
+    ) -> int:
         det_ts = self._parse_timestamp(timestamp_str)
         delta = det_ts - clip_start
         total_seconds = max(delta.total_seconds(), 0.0)
-        return int(total_seconds * VIDEO_FPS)
+        effective_fps = fps if fps > 0 else VIDEO_FPS
+        return int(round(total_seconds * effective_fps))
+
+    @staticmethod
+    def _extract_clip_fps(metadata: Dict[str, Any]) -> float:
+        raw_fps = metadata.get("fps")
+        try:
+            fps = float(raw_fps)
+        except (TypeError, ValueError):
+            return VIDEO_FPS
+        return fps if fps > 0 else VIDEO_FPS
 
     @staticmethod
     def _parse_timestamp(value: str) -> datetime:

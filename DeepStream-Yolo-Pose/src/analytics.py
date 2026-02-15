@@ -88,6 +88,9 @@ class RecordingManager:
         self.frames_without_detections = 0
         self.recording_frames = 0
         self._clip_basename: Optional[str] = None
+        self._clip_pts_first: Optional[int] = None
+        self._clip_pts_last: Optional[int] = None
+        self._clip_frame_samples = 0
 
     def on_detections(self, timestamp: str) -> None:
         """Update recording state when detections are present."""
@@ -109,14 +112,7 @@ class RecordingManager:
         self.splitmuxsink.set_property("location", "null/dummy.mp4")
         self.splitmuxsink.emit("split-now")
         self.recording = False
-        if self.video_path:
-            final_path = self.video_path.replace("temp_", "")
-            os.rename(self.video_path, final_path)
-            if self.metadata_writer:
-                self.metadata_writer.finalize_clip(self.video_id, final_path)
-        self.video_path = None
-        self.video_id = None
-        self._clip_basename = None
+        self._close_active_clip()
 
     def _start_new_clip(self, timestamp: str) -> None:
         """Start a fresh recording segment anchored to the timestamp."""
@@ -130,6 +126,7 @@ class RecordingManager:
         self.splitmuxsink.emit("split-now")
         self.recording = True
         self.recording_frames = 0
+        self._reset_clip_metrics()
         if self.metadata_writer and self.video_id:
             self.metadata_writer.start_clip(
                 video_id=self.video_id,
@@ -140,20 +137,16 @@ class RecordingManager:
     def _split_clip(self, timestamp: str) -> None:
         """Rotate to a new segment once the max clip length is exceeded."""
         # print("splitting long clip")
-        previous_video_id = self.video_id
-        previous_path = self.video_path
-        if previous_path:
-            final_path = previous_path.replace("temp_", "")
-            os.rename(previous_path, final_path)
-            if self.metadata_writer:
-                self.metadata_writer.finalize_clip(previous_video_id, final_path)
+        self._close_active_clip()
         self.video_id = str(uuid.uuid4())
         directory = os.path.join("output", str(self.camera_id))
         self.video_path = os.path.join(directory, f"temp_{timestamp}.mp4")
         self._clip_basename = timestamp
         self.splitmuxsink.set_property("location", self.video_path)
         self.splitmuxsink.emit("split-now")
+        self.recording = True
         self.recording_frames = 0
+        self._reset_clip_metrics()
         if self.metadata_writer and self.video_id:
             self.metadata_writer.start_clip(
                 video_id=self.video_id,
@@ -170,13 +163,47 @@ class RecordingManager:
         """Force a clip to close and persist metadata if recording is active."""
         if not self.recording or not self.video_path:
             return
-        final_path = self.video_path.replace("temp_", "")
         self.splitmuxsink.set_property("location", "null/dummy.mp4")
         self.splitmuxsink.emit("split-now")
-        os.rename(self.video_path, final_path)
-        if self.metadata_writer:
-            self.metadata_writer.finalize_clip(self.video_id, final_path)
+        self._close_active_clip()
         self.recording = False
+
+    def note_frame_pts(self, buf_pts: Optional[int]) -> None:
+        """Track frame PTS values for active clip FPS estimation."""
+        if not self.recording or buf_pts is None:
+            return
+        if self._clip_pts_first is None:
+            self._clip_pts_first = buf_pts
+        self._clip_pts_last = buf_pts
+        self._clip_frame_samples += 1
+
+    def _reset_clip_metrics(self) -> None:
+        self._clip_pts_first = None
+        self._clip_pts_last = None
+        self._clip_frame_samples = 0
+
+    def _compute_clip_fps(self) -> Optional[float]:
+        if (
+            self._clip_pts_first is None
+            or self._clip_pts_last is None
+            or self._clip_frame_samples < 2
+        ):
+            return None
+        elapsed_seconds = (self._clip_pts_last - self._clip_pts_first) / Gst.SECOND
+        if elapsed_seconds <= 0:
+            return None
+        return self._clip_frame_samples / elapsed_seconds
+
+    def _close_active_clip(self) -> None:
+        clip_fps = self._compute_clip_fps()
+        if self.video_path:
+            final_path = self.video_path.replace("temp_", "")
+            os.rename(self.video_path, final_path)
+            if self.metadata_writer:
+                if clip_fps is not None:
+                    self.metadata_writer.set_clip_fps(self.video_id, clip_fps)
+                self.metadata_writer.finalize_clip(self.video_id, final_path)
         self.video_path = None
         self.video_id = None
         self._clip_basename = None
+        self._reset_clip_metrics()

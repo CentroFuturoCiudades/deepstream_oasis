@@ -1,5 +1,5 @@
 BaseConfig:
-  minDetectorConfidence: 0.4
+  minDetectorConfidence: 0.5
 
 TargetManagement:
   maxTargetsPerStream: 150
