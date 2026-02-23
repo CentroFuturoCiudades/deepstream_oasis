@@ -77,3 +77,13 @@ DeepStream-Yolo-Pose/output/
 output/
 logs/
 DeepStream-Yolo-Pose/metadata.csv
+
+# Huge ML assets
+**/*.pt
+DeepStream-Yolo-Pose/models/
+DeepStream-Yolo-Pose/ultralytics/
+DeepStream-Yolo-Pose/utils/
+DeepStream-Yolo-Pose/output/
+output/
+logs/
+DeepStream-Yolo-Pose/metadata.csv
