@@ -65,3 +65,15 @@ Thumbs.db
 # (leave commented if you DO want it in the repo)
 # =========================
 # deepstream_python_apps/
+
+# runtime artifacts
+DeepStream-Yolo-Pose/metadata.csv
+
+# vendored / heavy deps
+DeepStream-Yolo-Pose/ultralytics/
+
+# Runtime artifacts
+DeepStream-Yolo-Pose/output/
+output/
+logs/
+DeepStream-Yolo-Pose/metadata.csv

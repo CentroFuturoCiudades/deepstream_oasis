@@ -1,0 +1,23 @@
+services:
+  deepstream_oasis_app:
+    image: ds8-pyds:oasis-app
+    container_name: deepstream_oasis_app
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - PYTHONUNBUFFERED=1
+      # Si tu app lee envs para EventHub/Blob/config, ponlos aquí o usa env_file
+      # - SOME_ENV=...
+    # Esto es CLAVE para que puedas ver logs/outputs desde host:
+    volumes:
+      - ./:/workspace/deepstream_oasis
+      - ./logs:/workspace/deepstream_oasis/logs
+      - ./output:/workspace/deepstream_oasis/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]

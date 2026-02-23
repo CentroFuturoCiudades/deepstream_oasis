@@ -1,0 +1,34 @@
+FROM ds8-pyds:oasis
+
+ENV VENV_DIR=/opt/venvs/pyds
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Solo si lo necesitas (ej. ffprobe para validar mp4). Si no, bórralo.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+COPY DeepStream-Yolo-Pose/src/age_group_classifier/requirements.txt /tmp/age_req.txt
+
+# Quitar torchreid y opencv-python (ya usamos opencv-python-headless del base)
+RUN grep -vE '^(torchreid|opencv-python)\b' /tmp/age_req.txt > /tmp/age_req_no_torchreid.txt && \
+    ${VENV_DIR}/bin/pip install --upgrade pip && \
+    ${VENV_DIR}/bin/pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision && \
+    ${VENV_DIR}/bin/pip install -r /tmp/age_req_no_torchreid.txt && \
+    rm -f /tmp/age_req.txt /tmp/age_req_no_torchreid.txt
+
+# Rivermax UDP plugin: no lo usas, desactívalo para evitar warning
+RUN mv /usr/lib/x86_64-linux-gnu/gstreamer-1.0/deepstream/libnvdsgst_udp.so \
+       /usr/lib/x86_64-linux-gnu/gstreamer-1.0/deepstream/libnvdsgst_udp.so.disabled || true
+
+WORKDIR /workspace/deepstream_oasis
+
+ENV OASIS_LOG_DIR=/workspace/deepstream_oasis/logs
+ENV OASIS_OUT_DIR=/workspace/deepstream_oasis/output
+
+RUN mkdir -p ${OASIS_LOG_DIR} ${OASIS_OUT_DIR}
+
+CMD ["bash","-lc","cd DeepStream-Yolo-Pose && python3 -u main.py"]
