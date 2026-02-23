@@ -1,24 +1,41 @@
 # =========================
-# DeepStream / TensorRT
+# Secrets
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# Runtime (NO repo)
+# =========================
+output/
+logs/
+DeepStream-Yolo-Pose/output/
+DeepStream-Yolo-Pose/logs/
+
+# =========================
+# DeepStream / TensorRT / Models
 # =========================
 **/*.engine
-**/*.onnx
-**/*.mp4
-**/*.jpg
 **/*.plan
 **/*.trt
+**/*.onnx
 **/*.cache
 **/.cache/
 **/cache/
-**/models/**/*.engine
-**/models/**/*.plan
+
+# Media artifacts (clips, images)
+**/*.mp4
+**/*.mkv
+**/*.avi
+**/*.jpg
+**/*.png
 
 # =========================
 # Python
 # =========================
-__pycache__/
+**/__pycache__/
 *.pyc
-*.env
 *.pyo
 *.pyd
 *.so
@@ -39,15 +56,12 @@ Thumbs.db
 .idea/
 
 # =========================
-# Logs
+# Logs (files)
 # =========================
 *.log
 
 # =========================
-# Optional: don't commit huge raw datasets
-# (pero vamos a conservar videos mp4 porque tú quieres)
+# Optional: if you don't want to vendor NVIDIA deepstream_python_apps
+# (leave commented if you DO want it in the repo)
 # =========================
-# **/*.mkv
-# **/*.avi
-
-deepstream_python_apps/
+# deepstream_python_apps/
