@@ -2,3 +2,6 @@
 [submodule "DeepStream-Yolo-Pose/src/age_group_classifier"]
 	path = DeepStream-Yolo-Pose/src/age_group_classifier
 	url = https://github.com/CentroFuturoCiudades/age-group-classifier.git
+[submodule "deepstream_python_apps"]
+	path = deepstream_python_apps
+	url = https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git
